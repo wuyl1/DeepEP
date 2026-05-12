@@ -271,6 +271,8 @@ if (ptx::deduplicate(dst_rank_idx, lane_idx) and dst_rank_idx >= 0)
     atomicAdd_block(rank_count + dst_rank_idx, 1);
 ```
 
+这里一个 warp 处理一个 token 的 top-k 列表：每个 lane 负责一个 top-k expert。`expert_count` 不去重，因为每个 expert 都需要统计；`rank_count` 会用 `deduplicate` 去重，因为同一个 token 发往同一个 rank 只需要一个 recv slot。
+
 各 SM 的局部计数会先用 `ptx::red_add` 汇总到 workspace，再由 SM 0 把最终的 rank / expert count 写到 peer rank 的 workspace：
 
 ```cpp

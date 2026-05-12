@@ -137,7 +137,8 @@ class ElasticBuffer:
                  sl_idx: int = 3,
                  num_allocated_qps: int = 0,
                  num_cpu_timeout_secs: int = 300, num_gpu_timeout_secs: int = 100,
-                 explicitly_destroy: bool = False):
+                 explicitly_destroy: bool = False,
+                 enable_dispatch_no_copy: bool = False):
         """
         Initialize the elastic communication buffer.
 
@@ -158,6 +159,8 @@ class ElasticBuffer:
             num_gpu_timeout_secs: GPU-side timeout in seconds for GPU operations.
             explicitly_destroy: If this flag is set to True, you need to explicitly call `destroy()` to release resources;
                 otherwise, the resources will be released by the destructor.
+            enable_dispatch_no_copy: whether to reserve extra symmetric memory for the experimental
+                direct normal dispatch no-copy path.
         """
         # Some useful utilities
         self.group = group
@@ -174,7 +177,8 @@ class ElasticBuffer:
             num_bytes = _C.calculate_elastic_buffer_size(
                 self.nccl_comm_handle.get(),
                 num_max_tokens_per_rank, hidden, num_topk, use_fp8_dispatch,
-                allow_hybrid_mode, allow_multiple_reduction)
+                allow_hybrid_mode, allow_multiple_reduction,
+                enable_dispatch_no_copy)
         if os.environ.get('EP_BUFFER_DEBUG', 0):
             print(f'Initializing EP elastic buffer with {num_bytes} bytes at rank EP {group.rank()}/{group.size()}')
         self.num_bytes = num_bytes
@@ -242,7 +246,8 @@ class ElasticBuffer:
                              num_max_tokens_per_rank: int, hidden: int,
                              num_topk: int = 0, use_fp8_dispatch: bool = False,
                              allow_hybrid_mode: bool = True,
-                             allow_multiple_reduction: bool = True) -> int:
+                             allow_multiple_reduction: bool = True,
+                             enable_dispatch_no_copy: bool = False) -> int:
         """
         Get a recommended buffer size (in bytes) for the given MoE settings, without constructing the buffer.
 
@@ -254,6 +259,8 @@ class ElasticBuffer:
             use_fp8_dispatch: whether to use FP8 for dispatch.
             allow_hybrid_mode: whether to enable hybrid mode.
             allow_multiple_reduction: whether to allow multiple reductions in combine.
+            enable_dispatch_no_copy: whether to include extra symmetric memory for the experimental
+                direct normal dispatch no-copy path.
 
         Returns:
             size: the recommended buffer size in bytes.
@@ -261,7 +268,8 @@ class ElasticBuffer:
         return _C.calculate_elastic_buffer_size(
             get_nccl_comm_handle(group).get(),
             num_max_tokens_per_rank, hidden, num_topk, use_fp8_dispatch,
-            allow_hybrid_mode, allow_multiple_reduction)
+            allow_hybrid_mode, allow_multiple_reduction,
+            enable_dispatch_no_copy)
 
     @staticmethod
     def get_engram_storage_size_hint(num_entries: int, hidden: int,
@@ -677,7 +685,8 @@ class ElasticBuffer:
                  do_handle_copy: bool = True,
                  do_cpu_sync: Optional[bool] = None,
                  do_expand: bool = False,
-                 use_tma_aligned_col_major_sf: bool = False) \
+                 use_tma_aligned_col_major_sf: bool = False,
+                 enable_dispatch_no_copy: bool = False) \
             -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                      Optional[torch.Tensor], Optional[torch.Tensor],
                      EPHandle, EventOverlap]:
@@ -717,6 +726,10 @@ class ElasticBuffer:
                 `None` defaults to `True` unless `handle` is provided.
             do_expand: whether to use the expanding layout (one slot per expert per token).
             use_tma_aligned_col_major_sf: whether to use TMA-aligned column-major layout for scale factors.
+            enable_dispatch_no_copy: whether to use the experimental direct normal dispatch no-copy path.
+                The buffer must be constructed with `enable_dispatch_no_copy=True` or enough manual `num_bytes`.
+                When enabled, the returned `recv_x` is a view into the `ElasticBuffer` symmetric buffer and
+                can be overwritten by later operations that reuse the same buffer.
 
         Returns:
             recv_x: received tokens, the same type and tuple as the input `x`
@@ -788,7 +801,8 @@ class ElasticBuffer:
                                         previous_event_before_epilogue,
                                         async_with_compute_stream, allocate_on_comm_stream,
                                         do_handle_copy, do_cpu_sync, do_expand,
-                                        use_tma_aligned_col_major_sf)
+                                        use_tma_aligned_col_major_sf,
+                                        enable_dispatch_no_copy)
         if handle is None:
             handle = EPHandle(do_expand,
                               num_experts, expert_alignment,

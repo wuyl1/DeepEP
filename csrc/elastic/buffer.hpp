@@ -530,7 +530,8 @@ public:
                                             const int& hidden, const int& num_sf_packs, const int& num_topk,
                                             const int& elem_size,
                                             const int& num_scaleout_ranks, const int& num_scaleup_ranks,
-                                            const bool& is_scaleup_nvlink) {
+                                            const bool& is_scaleup_nvlink,
+                                            const bool& enable_dispatch_no_copy = false) {
         const auto num_ranks = num_scaleup_ranks * num_scaleout_ranks;
         const auto token_layout = get_dispatch_token_layout(hidden, elem_size, num_sf_packs, num_topk);
 
@@ -540,7 +541,14 @@ public:
                 token_layout, is_scaleup_nvlink ? 0 : 1, num_max_tokens_per_rank);
             const auto recv_buffer_layout = layout::BufferLayout<false>(
                 token_layout, num_ranks, num_max_tokens_per_rank);
-            return send_buffer_layout.get_num_bytes() + recv_buffer_layout.get_num_bytes();
+            auto num_bytes = send_buffer_layout.get_num_bytes() + recv_buffer_layout.get_num_bytes();
+            if (enable_dispatch_no_copy) {
+                const auto recv_x_buffer_bytes =
+                    static_cast<int64_t>(num_ranks) * num_max_tokens_per_rank * hidden * elem_size;
+                const auto recv_x_offset_buffer_bytes = num_ranks * static_cast<int64_t>(sizeof(int64_t));
+                num_bytes += recv_x_buffer_bytes + recv_x_offset_buffer_bytes;
+            }
+            return num_bytes;
         } else {
             // Hybrid dispatch
             const auto scaleup_recv_buffer = layout::BufferLayout<false>(
@@ -596,7 +604,8 @@ public:
                                          const int& num_max_tokens_per_rank, const int& hidden,
                                          int num_topk, const bool& use_fp8_dispatch,
                                          const bool& allow_hybrid_mode,
-                                         const bool& allow_multiple_reduction) {
+                                         const bool& allow_multiple_reduction,
+                                         const bool& enable_dispatch_no_copy = false) {
         EP_HOST_ASSERT(num_max_tokens_per_rank > 0 and hidden > 0);
 
         // The worst case SF bytes must be less than the main part
@@ -616,7 +625,8 @@ public:
         const auto num_dispatch_bytes = get_dispatch_buffer_size(
             num_max_tokens_per_rank, hidden, num_sf_packs, num_topk, elem_size,
             num_scaleout_ranks, num_scaleup_ranks,
-            is_scaleup_nvlink);
+            is_scaleup_nvlink,
+            enable_dispatch_no_copy and num_scaleout_ranks == 1 and not use_fp8_dispatch);
 
         // Combine layout
         const auto num_combine_bytes = get_combine_buffer_size(
@@ -655,7 +665,8 @@ public:
              const bool& async_with_compute_stream,
              const bool& allocate_on_comm_stream,
              const bool& do_handle_copy, const bool& do_cpu_sync, const bool& do_expand,
-             const bool& use_tma_aligned_col_major_sf) const {
+             const bool& use_tma_aligned_col_major_sf,
+             const bool& enable_dispatch_no_copy) const {
         // Check SM count
         EP_HOST_ASSERT(num_sms > 0);
 
@@ -896,10 +907,15 @@ public:
         }
 
         // Check buffer size
+        const bool no_copy_dispatch =
+            enable_dispatch_no_copy and
+            nccl_context->num_scaleout_ranks == 1 and
+            not cached_mode and not deterministic and not do_expand and num_sf_packs == 0;
+        EP_HOST_ASSERT(not enable_dispatch_no_copy or no_copy_dispatch);
         EP_HOST_ASSERT(get_dispatch_buffer_size(
                        num_max_tokens_per_rank, hidden, num_sf_packs, num_topk, x.element_size(),
                        nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
-                       nccl_context->is_scaleup_nvlink) <= num_buffer_bytes);
+                       nccl_context->is_scaleup_nvlink, no_copy_dispatch) <= num_buffer_bytes);
 
         // Ready and clean host workspace for this round
         const auto host_workspace_layout = layout::WorkspaceLayout(
@@ -934,7 +950,7 @@ public:
                         num_sms, num_channels_per_sm,
                         num_smem_bytes,
                         num_qps, num_gpu_timeout_cycles,
-                        cached_mode, deterministic, do_cpu_sync,
+                        cached_mode, deterministic, do_cpu_sync, no_copy_dispatch,
                         comm_stream);
 
         // Received token counters
@@ -1010,7 +1026,19 @@ public:
         // Allocate received tensors
         // `recv_src_metadata` includes source token indices and buffer slot indices
         const auto num_allocated_tokens = do_expand ? num_expanded_tokens : num_recv_tokens;
-        auto recv_x = torch::empty({num_allocated_tokens, hidden}, x.options());
+        torch::Tensor recv_x;
+        if (no_copy_dispatch) {
+            const auto token_layout = get_dispatch_token_layout(hidden, x.element_size(), num_sf_packs, num_topk);
+            const auto recv_buffer_layout = layout::BufferLayout<false>(
+                token_layout, nccl_context->num_ranks, num_max_tokens_per_rank, buffer);
+            const auto send_buffer_layout = layout::BufferLayout<false>(
+                token_layout, nccl_context->is_scaleup_nvlink ? 0 : 1,
+                num_max_tokens_per_rank, recv_buffer_layout.get_buffer_end_ptr());
+            recv_x = torch::from_blob(send_buffer_layout.get_buffer_end_ptr(),
+                                      {num_allocated_tokens, hidden}, x.options());
+        } else {
+            recv_x = torch::empty({num_allocated_tokens, hidden}, x.options());
+        }
         auto recv_sf = std::optional<torch::Tensor>();
         auto recv_topk_idx = std::optional<torch::Tensor>();
         auto recv_topk_weights = std::optional<torch::Tensor>();
@@ -1075,7 +1103,7 @@ public:
                                       jit::device_runtime->get_num_sms(),
                                       jit::device_runtime->get_num_smem_bytes(),
                                       num_channels,
-                                      do_expand, cached_mode,
+                                      do_expand, cached_mode, no_copy_dispatch,
                                       comm_stream);
 
         // Stream control
@@ -1292,7 +1320,15 @@ static void register_apis(pybind11::module_& m) {
         .def("all_gather", &ElasticBuffer::all_gather)
         .def("dispatch", &ElasticBuffer::dispatch)
         .def("combine", &ElasticBuffer::combine);
-    m.def("calculate_elastic_buffer_size", &ElasticBuffer::calculate_buffer_size);
+    m.def("calculate_elastic_buffer_size", &ElasticBuffer::calculate_buffer_size,
+          pybind11::arg("nccl_comm"),
+          pybind11::arg("num_max_tokens_per_rank"),
+          pybind11::arg("hidden"),
+          pybind11::arg("num_topk"),
+          pybind11::arg("use_fp8_dispatch"),
+          pybind11::arg("allow_hybrid_mode"),
+          pybind11::arg("allow_multiple_reduction"),
+          pybind11::arg("enable_dispatch_no_copy") = false);
 
     // NCCL communicator handle
     m.def("get_local_nccl_unique_id", &nccl::get_local_unique_id);

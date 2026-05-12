@@ -17,6 +17,7 @@ namespace deep_ep::elastic {
 template <bool kIsScaleupNVLink,
           bool kDoCPUSync,
           bool kReuseSlotIndices,
+          bool kNoCopy,
           int kNumSMs,
           int kNumNotifyWarps, int kNumDispatchWarps,
           int kNumRanks,
@@ -45,6 +46,8 @@ dispatch_impl(
     constexpr int kNumExpertsPerRank = kNumExperts / kNumRanks;
     EP_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
     EP_STATIC_ASSERT(kNumNotifyWarps % 4 == 0, "Invalid warpgroup size");
+    EP_STATIC_ASSERT(not kNoCopy or (not kReuseSlotIndices and kNumSFPacks == 0),
+                     "No-copy dispatch only supports non-cached BF16 normal layout");
 
     // Utils
     const auto sm_idx = static_cast<int>(blockIdx.x), thread_idx = static_cast<int>(threadIdx.x);
@@ -68,6 +71,22 @@ dispatch_impl(
     const auto [qp_idx, sharing_mode] = comm::get_qp_mode<kNumSMs, kNumQPs, kNumDispatchWarps, (kNumNotifyWarps > 0)>(
         sm_idx, warp_idx - kNumNotifyWarps, warp_idx < kNumNotifyWarps);
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
+
+    // Direct no-copy layout extension:
+    //   recv_buffer | send_buffer(optional) | recv_x_buffer | recv_x_offset_buffer
+    // `recv_x_offset_buffer[target_rank]` stores the compact base offset assigned by the target rank.
+    const auto global_token_layout = layout::TokenLayout(kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true);
+    const auto global_recv_buffer = layout::BufferLayout<false>(global_token_layout, kNumRanks, kNumMaxTokensPerRank, buffer);
+    const auto global_send_buffer = layout::BufferLayout<false>(
+        global_token_layout, kIsScaleupNVLink ? 0 : 1, kNumMaxTokensPerRank, global_recv_buffer.get_buffer_end_ptr());
+    void* direct_recv_x_buffer = global_send_buffer.get_buffer_end_ptr();
+    auto direct_recv_x_offset_buffer = math::advance_ptr<int64_t>(
+        direct_recv_x_buffer, static_cast<int64_t>(kNumRanks) * kNumMaxTokensPerRank * kNumHiddenBytes);
+
+    if constexpr (kNoCopy) {
+        if (sm_idx == 0 and thread_idx < kNumRanks)
+            direct_recv_x_offset_buffer[thread_idx] = 0;
+    }
 
     // Barrier without TMA store flush, without prologue grid sync
     comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
@@ -245,6 +264,26 @@ dispatch_impl(
             if (warp_idx == 0) {
                 // Inclusive prefix sum
                 do_psum(rank_count, psum_num_recv_tokens_per_scaleup_rank, kNumRanks, 0);
+
+                if constexpr (kNoCopy) {
+                    int psum = 0;
+                    #pragma unroll
+                    for (int i = 0; i < math::ceil_div(kNumRanks, 32); ++ i) {
+                        const auto src_rank_idx = i * 32 + lane_idx;
+                        const auto value = src_rank_idx < kNumRanks ? rank_count[src_rank_idx] : 0;
+                        const auto sum = psum + ptx::warp_inclusive_sum(value, lane_idx);
+                        const auto base_offset = sum - value;
+
+                        // Tell each source rank where its compact `recv_x` segment starts on this target rank.
+                        if (src_rank_idx < kNumRanks) {
+                            const auto encoded_offset = math::encode_decode_positive<int64_t>(base_offset);
+                            const auto dst_ptr = direct_recv_x_offset_buffer + rank_idx;
+                            gin.put_value<team_t>(dst_ptr, encoded_offset, src_rank_idx);
+                        }
+
+                        psum = ptx::exchange(sum, 31);
+                    }
+                }
             } else if (warp_idx == 1) {
                 // Exclusive prefix sum for later expanding
                 do_psum(expert_count, psum_num_recv_tokens_per_expert, kNumExpertsPerRank, 1);
@@ -267,6 +306,35 @@ dispatch_impl(
         if (ptx::elect_one_sync())
             ptx::mbarrier_init_with_fence(mbarrier_ptr, 1);
         __syncwarp();
+
+        // No-copy mode needs the compact recv_x base offset assigned by each target rank.
+        // Wait once before the token loop; later tokens only read the cached warp-local value.
+        constexpr int kNumRanksPerLane = math::constexpr_ceil_div(kNumRanks, 32);
+        int recv_x_base_offsets[kNumRanksPerLane];
+        if constexpr (kNoCopy) {
+            #pragma unroll
+            for (int i = 0; i < kNumRanksPerLane; ++ i) {
+                const auto target_rank_idx = i * 32 + lane_idx;
+                recv_x_base_offsets[i] = -1;
+                if (target_rank_idx < kNumRanks) {
+                    const auto start_clock = clock64();
+                    comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
+                        const auto encoded_offset = ptx::ld_volatile<int64_t>(direct_recv_x_offset_buffer + target_rank_idx);
+                        const auto decoded_offset = math::encode_decode_positive(encoded_offset);
+                        if (math::is_decoded_positive_ready(decoded_offset)) {
+                            recv_x_base_offsets[i] = static_cast<int>(decoded_offset);
+                            return true;
+                        }
+
+                        if (is_last_check)
+                            printf("DeepEP no-copy dispatch offset timeout, rank: %d, target: %d\n",
+                                   rank_idx, target_rank_idx);
+                        return false;
+                    }, start_clock);
+                }
+            }
+            __syncwarp();
+        }
 
         // Iterate all tokens
         const auto token_start = dispatch_warp_idx * kNumSMs + sm_idx;
@@ -353,37 +421,97 @@ dispatch_impl(
             }
             __syncwarp();
 
-            // TMA store to send buffer
-            auto send_buffer_ptr = send_buffer.get_token_buffer(token_idx).get_base_ptr();
-            if constexpr (not kIsScaleupNVLink) {
-                if (ptx::elect_one_sync())
-                    ptx::tma_store_1d(send_buffer_ptr, tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
-                ptx::tma_store_commit();
-                __syncwarp();
-            }
+            auto send_token = send_buffer.get_token_buffer(token_idx);
+            auto send_buffer_ptr = send_token.get_base_ptr();
 
-            // Issue TMA NVLink stores
-            EP_STATIC_ASSERT(kNumTopk <= 32, "Invalid top-k selection");
-            const auto dst_ptr = stored_dst_slot_idx >= 0 ?
-                gin.get_sym_ptr<team_t>(recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(), stored_dst_rank_idx) :
-                nullptr;
-            if (dst_ptr != nullptr)
-                ptx::tma_store_1d(dst_ptr, tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
-            ptx::tma_store_commit();
-            __syncwarp();
+            if constexpr (kNoCopy) {
+                constexpr int kNumMetadataBytes = math::constexpr_align<int>(
+                    kNumTopk * (static_cast<int>(sizeof(int)) + static_cast<int>(sizeof(float))) +
+                    (1 + kNumTopk) * static_cast<int>(sizeof(int)),
+                    ptx::kNumTMAAlignBytes);
 
-            // Issue RDMA put
-            if constexpr (not kIsScaleupNVLink) {
-                // Wait the send buffer store to arrive
-                ptx::tma_store_wait<1>();
-                __syncwarp();
-
-                // NOTES: we should skip the NVLink accessible ranks
-                if (stored_dst_slot_idx >= 0 and dst_ptr == nullptr) {
-                    gin.put<team_t>(recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(),
-                                    send_buffer_ptr, tma_buffer.get_num_bytes<false>(), stored_dst_rank_idx);
+                int recv_x_base_offset = -1;
+                const auto has_valid_dst_slot = stored_dst_slot_idx >= 0;
+                const auto offset_lane_idx = has_valid_dst_slot ? stored_dst_rank_idx % 32 : 0;
+                const auto offset_group_idx = has_valid_dst_slot ? stored_dst_rank_idx / 32 : 0;
+                #pragma unroll
+                for (int i = 0; i < kNumRanksPerLane; ++ i) {
+                    const auto candidate_offset = ptx::exchange(recv_x_base_offsets[i], offset_lane_idx);
+                    if (has_valid_dst_slot and i == offset_group_idx)
+                        recv_x_base_offset = candidate_offset;
                 }
                 __syncwarp();
+
+                const auto compact_recv_x_idx = recv_x_base_offset + stored_dst_slot_idx;
+                const auto local_recv_x_ptr = has_valid_dst_slot ?
+                    math::advance_ptr(direct_recv_x_buffer, static_cast<int64_t>(compact_recv_x_idx) * kNumHiddenBytes) :
+                    nullptr;
+                const auto remote_recv_x_ptr = local_recv_x_ptr != nullptr ?
+                    gin.get_sym_ptr<team_t>(local_recv_x_ptr, stored_dst_rank_idx) : nullptr;
+                const auto remote_metadata_ptr = has_valid_dst_slot ?
+                    gin.get_sym_ptr<team_t>(
+                        recv_buffer.get_token_buffer(stored_dst_slot_idx).get_metadata_ptr(), stored_dst_rank_idx) :
+                    nullptr;
+
+                if constexpr (not kIsScaleupNVLink) {
+                    if (ptx::elect_one_sync()) {
+                        ptx::tma_store_1d(send_token.get_hidden_ptr(), tma_buffer.get_hidden_ptr(), kNumHiddenBytes);
+                        ptx::tma_store_1d(send_token.get_metadata_ptr(), tma_buffer.get_metadata_ptr(), kNumMetadataBytes);
+                    }
+                    ptx::tma_store_commit();
+                    __syncwarp();
+                }
+
+                if (remote_recv_x_ptr != nullptr)
+                    ptx::tma_store_1d(remote_recv_x_ptr, tma_buffer.get_hidden_ptr(), kNumHiddenBytes);
+                if (remote_metadata_ptr != nullptr)
+                    ptx::tma_store_1d(remote_metadata_ptr, tma_buffer.get_metadata_ptr(), kNumMetadataBytes);
+                ptx::tma_store_commit();
+                __syncwarp();
+
+                if constexpr (not kIsScaleupNVLink) {
+                    ptx::tma_store_wait();
+                    __syncwarp();
+
+                    if (has_valid_dst_slot and remote_recv_x_ptr == nullptr) {
+                        gin.put<team_t>(local_recv_x_ptr, send_token.get_hidden_ptr(), kNumHiddenBytes, stored_dst_rank_idx);
+                        gin.put<team_t>(recv_buffer.get_token_buffer(stored_dst_slot_idx).get_metadata_ptr(),
+                                        send_token.get_metadata_ptr(), kNumMetadataBytes, stored_dst_rank_idx);
+                    }
+                    __syncwarp();
+                }
+            } else {
+                // TMA store to send buffer
+                if constexpr (not kIsScaleupNVLink) {
+                    if (ptx::elect_one_sync())
+                        ptx::tma_store_1d(send_buffer_ptr, tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
+                    ptx::tma_store_commit();
+                    __syncwarp();
+                }
+
+                // Issue TMA NVLink stores
+                EP_STATIC_ASSERT(kNumTopk <= 32, "Invalid top-k selection");
+                const auto dst_ptr = stored_dst_slot_idx >= 0 ?
+                    gin.get_sym_ptr<team_t>(recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(), stored_dst_rank_idx) :
+                    nullptr;
+                if (dst_ptr != nullptr)
+                    ptx::tma_store_1d(dst_ptr, tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
+                ptx::tma_store_commit();
+                __syncwarp();
+
+                // Issue RDMA put
+                if constexpr (not kIsScaleupNVLink) {
+                    // Wait the send buffer store to arrive
+                    ptx::tma_store_wait<1>();
+                    __syncwarp();
+
+                    // NOTES: we should skip the NVLink accessible ranks
+                    if (stored_dst_slot_idx >= 0 and dst_ptr == nullptr) {
+                        gin.put<team_t>(recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(),
+                                        send_buffer_ptr, tma_buffer.get_num_bytes<false>(), stored_dst_rank_idx);
+                    }
+                    __syncwarp();
+                }
             }
         }
     }
@@ -400,6 +528,10 @@ dispatch_impl(
     EP_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");
     if (not kReuseSlotIndices and sm_idx == 0 and thread_idx < kNumRanks)
         workspace_layout.get_scaleup_atomic_sender_counter()[thread_idx] = 0;
+    if constexpr (kNoCopy) {
+        if (sm_idx == 0 and thread_idx < kNumRanks)
+            direct_recv_x_offset_buffer[thread_idx] = 0;
+    }
 }
 
 }  // namespace deep_ep::elastic

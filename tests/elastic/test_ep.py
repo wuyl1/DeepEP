@@ -70,6 +70,10 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
                f' > Tokens: {num_tokens} (max: {num_max_tokens_per_rank}), hidden: {hidden}\n'
                f' > #SM: {num_sms}, #QPs: {num_qps}/{buffer.num_allocated_qps}\n',
                once_in_node=True)
+    if args.enable_dispatch_no_copy:
+        dist_print('No-copy dispatch benchmark is enabled only for direct, non-deterministic, '
+                   'BF16 normal dispatch cases. Unsupported cases are skipped.',
+                   once_in_node=True)
 
     # Construct expert selections first (may have an unbalanced ratio here)
     scores = get_unbalanced_scores(num_tokens, num_experts, buffer.num_ranks, num_topk, args.unbalanced_ratio, args.precise_unbalanced_ratio)
@@ -162,6 +166,14 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
             handle=handle)
         cached_recv_x, cached_recv_topk_idx, cached_recv_topk_weights, cached_handle, cached_dispatch_event = \
             launch(buffer, 'dispatch', with_previous_event, async_with_compute_stream, cached_dispatch_args)
+
+        # No-copy mode is intentionally benchmark-only here. It returns `recv_x` as a view into the
+        # ElasticBuffer symmetric buffer, so later operations that reuse the buffer may overwrite it.
+        # Avoid feeding no-copy output into combine tests in this script.
+        no_copy_dispatch_args = None
+        if (args.enable_dispatch_no_copy and num_scaleout_ranks == 1 and
+                not args.deterministic and not use_fp8_dispatch):
+            no_copy_dispatch_args = dispatch_args | dict(enable_dispatch_no_copy=True)
         
         # Count the number of received tokens
         num_recv_tokens = handle.psum_num_recv_tokens_per_scaleup_rank[-1].item()
@@ -245,6 +257,17 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
                     f'{num_scaleout_bytes / t / 1e9:.0f} GB/s (SO), '
                     f'{num_scaleup_bytes / t / 1e9:.0f} GB/s (SU), {t * 1e6:.3f} us, {num_scaleup_bytes:.0f} bytes | '
                     f'copy: {2 * num_recv_tokens * num_bytes_per_dispatch_token / copy_t / 1e9:.0f} GB/s, {copy_t * 1e6:.3f} us')
+
+            # Test no-copy dispatch performance
+            if no_copy_dispatch_args is not None:
+                t, copy_t = bench_kineto(lambda: buffer.dispatch(**no_copy_dispatch_args),
+                                        kernel_names=('dispatch_impl', 'dispatch_copy_epilogue_impl'),
+                                        barrier_comm_profiling=True, barrier=buffer.barrier, trace_path=get_trace_path('no_copy_dispatch'))
+                dist_print(f'   ! EP: {buffer.rank_idx:3}/{buffer.num_ranks} | '
+                        f'no-copy dispatch: '
+                        f'{num_scaleout_bytes / t / 1e9:.0f} GB/s (SO), '
+                        f'{num_scaleup_bytes / t / 1e9:.0f} GB/s (SU), {t * 1e6:.3f} us, {num_scaleup_bytes:.0f} bytes | '
+                        f'epilogue: {copy_t * 1e6:.3f} us')
 
             # Test expanded dispatch performance
             num_bytes_per_dispatch_token_meta = safe_div(count_bytes(expanded_handle.recv_src_metadata), expanded_handle.recv_src_metadata.size(0))
@@ -364,6 +387,19 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
                 handle.recv_src_metadata = handle.recv_src_metadata[:num_recv_tokens]
                 expanded_handle.recv_src_metadata = expanded_handle.recv_src_metadata[:num_recv_tokens]
 
+            no_copy_recv_x = None
+            no_copy_recv_topk_idx = None
+            no_copy_recv_topk_weights = None
+            no_copy_handle = None
+            if no_copy_dispatch_args is not None:
+                no_copy_recv_x, no_copy_recv_topk_idx, no_copy_recv_topk_weights, no_copy_handle, _ = \
+                    launch(buffer, 'dispatch', with_previous_event, async_with_compute_stream, no_copy_dispatch_args)
+                if not args.do_cpu_sync:
+                    no_copy_recv_x = no_copy_recv_x[:num_recv_tokens]
+                    no_copy_recv_topk_idx = no_copy_recv_topk_idx[:num_recv_tokens]
+                    no_copy_recv_topk_weights = no_copy_recv_topk_weights[:num_recv_tokens]
+                    no_copy_handle.recv_src_metadata = no_copy_handle.recv_src_metadata[:num_recv_tokens]
+
             # Make sure deterministic mode works by doing the dispatch twice
             if args.deterministic:
                 recv_x_twice, recv_topk_idx_twice, recv_topk_weights_twice, handle_twice, dispatch_event_twice = \
@@ -426,10 +462,15 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
                 assert count == ref_count, f'{ref_count=}, {count=}'
 
             # Check dispatch data
-            for check_recv_x, check_recv_topk_idx, check_recv_topk_weights, check_handle in (
+            check_dispatch_outputs = [
                 (expanded_recv_x, None, expanded_recv_topk_weights, expanded_handle),  # Expanded
                 (recv_x, recv_topk_idx, recv_topk_weights, handle),  # Unexpanded
-            ):
+            ]
+            if no_copy_handle is not None:
+                check_dispatch_outputs.append(
+                    (no_copy_recv_x, no_copy_recv_topk_idx, no_copy_recv_topk_weights, no_copy_handle)
+                )
+            for check_recv_x, check_recv_topk_idx, check_recv_topk_weights, check_handle in check_dispatch_outputs:
                 for i in range(buffer.num_ranks):
                     rank_start_idx = sum(ref_num_recv_tokens_per_rank[:i])
                     rank_end_idx = rank_start_idx + ref_num_recv_tokens_per_rank[i]
@@ -481,6 +522,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                                      allow_hybrid_mode=args.allow_hybrid_mode,
                                      allow_multiple_reduction=args.allow_multiple_reduction,
                                      prefer_overlap_with_compute=bool(args.prefer_overlap_with_compute),
+                                     enable_dispatch_no_copy=args.enable_dispatch_no_copy,
                                      sl_idx=args.sl_idx,
                                      num_allocated_qps=max(args.num_allocated_qps, args.num_qps),
                                      explicitly_destroy=True,
@@ -539,6 +581,8 @@ if __name__ == '__main__':
     parser.add_argument('--allow-multiple-reduction', type=int, default=1, help='Whether to allow multiple reductions')
     parser.add_argument('--prefer-overlap-with-compute', type=int, default=0, help='Whether to prefer overlap with compute')
     parser.add_argument('--deterministic', action='store_true', help='Use deterministic algorithm')
+    parser.add_argument('--enable-dispatch-no-copy', action='store_true',
+                        help='Benchmark experimental direct BF16 normal dispatch no-copy path')
 
     # Test settings
     parser.add_argument('--seed', type=int, default=0, help='Default seed for pressure tests')

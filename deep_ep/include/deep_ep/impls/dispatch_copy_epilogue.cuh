@@ -8,7 +8,7 @@
 
 namespace deep_ep::elastic {
 
-template <bool kDoExpand, bool kCachedMode,
+template <bool kDoExpand, bool kCachedMode, bool kNoCopy,
           // NOTES: this channel concept only applies for scale-out ranks
           int kNumSMs, int kNumChannels, int kNumWarps,
           int kNumScaleoutRanks, int kNumScaleupRanks,
@@ -30,6 +30,9 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
                             int num_recv_tokens,
                             const int recv_sf_token_stride, const int recv_sf_hidden_stride,
                             const int scaleout_rank_idx, const int scaleup_rank_idx) {
+    EP_STATIC_ASSERT(not kNoCopy or (not kDoExpand and kNumScaleoutRanks == 1 and kNumSFPacks == 0),
+                     "No-copy epilogue only supports direct BF16 normal layout");
+
     // Utils
     const auto sm_idx = static_cast<int>(blockIdx.x), thread_idx = static_cast<int>(threadIdx.x);
     const auto warp_idx = ptx::get_warp_idx(), lane_idx = ptx::get_lane_idx();
@@ -83,14 +86,17 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         ptx::tma_store_wait();
         __syncwarp();
 
-        // Issue TMA loads
-        // Including all stuffs: data, SF, top-k metadata
-        if (ptx::elect_one_sync()) {
-            ptx::tma_load_1d(tma_buffer.get_base_ptr(), buffer_token.get_base_ptr(),
-                             mbarrier_ptr, tma_buffer.get_num_bytes<false>());
-            ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, tma_buffer.get_num_bytes<false>());
+        if constexpr (not kNoCopy) {
+            // Issue TMA loads
+            // Including all stuffs: data, SF, top-k metadata
+            if (ptx::elect_one_sync()) {
+                ptx::tma_load_1d(tma_buffer.get_base_ptr(), buffer_token.get_base_ptr(),
+                                 mbarrier_ptr, tma_buffer.get_num_bytes<false>());
+                ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, tma_buffer.get_num_bytes<false>());
+            }
+            __syncwarp();
         }
-        __syncwarp();
+        const auto metadata_token = kNoCopy ? buffer_token : tma_buffer;
 
         // Load target expert indices separately to tolerate TMA load latency
         EP_STATIC_ASSERT(kNumTopk <= 32, "Too many top-k selections");
@@ -118,24 +124,28 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         __syncwarp();
 
         // Wait for TMA arrival
-        if (ptx::elect_one_sync())
-            ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
-        __syncwarp();
+        if constexpr (not kNoCopy) {
+            if (ptx::elect_one_sync())
+                ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+            __syncwarp();
+        }
 
         // Maintain linked list
         if constexpr (kDoCreateLinkedList) {
             if (ptx::elect_one_sync())
-                channel_linked_list[tma_buffer.get_linked_list_idx_ptr()[master_src_topk_idx]] = i;
+                channel_linked_list[metadata_token.get_linked_list_idx_ptr()[master_src_topk_idx]] = i;
             __syncwarp();
         }
 
         // Issue TMA stores for data
-        if (kDoExpand ? (dst_tensor_idx >= 0) : ptx::elect_one_sync()) {
-            ptx::tma_store_1d(math::advance_ptr(recv_x, static_cast<int64_t>(dst_tensor_idx) * kNumHiddenBytes),
-                              tma_buffer.get_hidden_ptr(), kNumHiddenBytes);
-            ptx::tma_store_commit();
+        if constexpr (not kNoCopy) {
+            if (kDoExpand ? (dst_tensor_idx >= 0) : ptx::elect_one_sync()) {
+                ptx::tma_store_1d(math::advance_ptr(recv_x, static_cast<int64_t>(dst_tensor_idx) * kNumHiddenBytes),
+                                  tma_buffer.get_hidden_ptr(), kNumHiddenBytes);
+                ptx::tma_store_commit();
+            }
+            __syncwarp();
         }
-        __syncwarp();
 
         // Store SF
         if constexpr (kNumSFPacks > 0) {
@@ -173,10 +183,10 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
 
         // Store the top-k weights
         if (kDoExpand and recv_topk_weights != nullptr and dst_tensor_idx >= 0) {
-            recv_topk_weights[dst_tensor_idx] = tma_buffer.get_topk_weights_ptr()[lane_idx];
+            recv_topk_weights[dst_tensor_idx] = metadata_token.get_topk_weights_ptr()[lane_idx];
         } else if (not kDoExpand and recv_topk_weights != nullptr and lane_idx < kNumTopk) {
             // For backward, weights are optional
-            recv_topk_weights[i * kNumTopk + lane_idx] = tma_buffer.get_topk_weights_ptr()[lane_idx];
+            recv_topk_weights[i * kNumTopk + lane_idx] = metadata_token.get_topk_weights_ptr()[lane_idx];
         }
         __syncwarp();
 
@@ -186,7 +196,7 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         //   - Hybrid mode: the slot index and master top-k lane index
         constexpr int kMetadataStride = 2 + kNumTopk;
         if (ptx::elect_one_sync()) {
-            recv_src_metadata[i * kMetadataStride + 0] = *tma_buffer.get_src_token_global_idx_ptr();
+            recv_src_metadata[i * kMetadataStride + 0] = *metadata_token.get_src_token_global_idx_ptr();
             if constexpr (kNumScaleoutRanks == 1) {
                 recv_src_metadata[i * kMetadataStride + 1] = current_rank_idx * kNumTopk + master_src_topk_idx;
             } else {
