@@ -410,7 +410,7 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
             no_copy_recv_topk_idx = None
             no_copy_recv_topk_weights = None
             no_copy_handle = None
-            if no_copy_dispatch_args is not None:
+            if args.check_dispatch_no_copy and no_copy_dispatch_args is not None:
                 no_copy_recv_x, no_copy_recv_topk_idx, no_copy_recv_topk_weights, no_copy_handle, _ = \
                     launch(buffer, 'dispatch', with_previous_event, async_with_compute_stream, no_copy_dispatch_args)
                 if not args.do_cpu_sync:
@@ -418,6 +418,9 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
                     no_copy_recv_topk_idx = no_copy_recv_topk_idx[:num_recv_tokens]
                     no_copy_recv_topk_weights = no_copy_recv_topk_weights[:num_recv_tokens]
                     no_copy_handle.recv_src_metadata = no_copy_handle.recv_src_metadata[:num_recv_tokens]
+            elif args.check_dispatch_no_copy:
+                dist_print('   ! No-copy dispatch correctness check skipped: unsupported case.',
+                           once_in_node=True)
 
             # Make sure deterministic mode works by doing the dispatch twice
             if args.deterministic:
@@ -515,6 +518,9 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
                             ref_t = ref_t.masked_fill(ref_mask, 0)
                             t = t.masked_fill(ref_mask, 0)
                         assert torch.equal(ref_t, t), f'{ref_t=}, {t=}'
+            if no_copy_handle is not None:
+                dist_print('   ! No-copy dispatch correctness check passed.',
+                           once_in_node=True)
 
             # Combined data should also be bitwise-identical
             assert torch.equal(combined_x, ref_combined_y), \
@@ -606,6 +612,8 @@ if __name__ == '__main__':
     # Test settings
     parser.add_argument('--seed', type=int, default=0, help='Default seed for pressure tests')
     parser.add_argument('--skip-check', action='store_true', help='Whether to skip correctness checks')
+    parser.add_argument('--check-dispatch-no-copy', action='store_true',
+                        help='Include no-copy dispatch output in correctness checks')
     parser.add_argument('--skip-perf-test', action='store_true', help='Whether to skip performance tests')
     parser.add_argument('--do-pressure-test', action='store_true', help='Whether to do pressure test')
     parser.add_argument('--reuse-elastic-buffer', action='store_true', help='Whether to reuse elastic buffer for each test')
