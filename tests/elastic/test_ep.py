@@ -2,7 +2,7 @@ import argparse
 import os
 import torch
 import torch.distributed as dist
-from typing import Union, Tuple, Optional
+from typing import Callable, Union, Tuple, Optional
 
 import deep_ep
 from deep_ep.utils.math import (
@@ -15,7 +15,7 @@ from deep_ep.utils.envs import init_dist, init_seed, dist_print
 from deep_ep.utils.refs import dispatch as ref_dispatch
 from deep_ep.utils.refs import combine as ref_combine
 from deep_ep.utils.refs import generate_pre_combine_data, ordered_accumulate
-from deep_ep.utils.testing import bench_kineto
+from deep_ep.utils.testing import bench, bench_kineto
 
 
 # noinspection PyUnusedLocal,PyShadowingNames
@@ -39,6 +39,25 @@ def launch(buffer: deep_ep.ElasticBuffer, name: str,
     values = getattr(buffer, name)(**params)
     values[-1].current_stream_wait() if async_with_compute_stream else ()
     return values
+
+
+def bench_kineto_with_event_fallback(fn: Callable,
+                                     kernel_names: Union[str, tuple],
+                                     **kwargs):
+    durations = bench_kineto(fn, kernel_names=kernel_names, **kwargs)
+    is_multi = isinstance(durations, (list, tuple))
+    duration_tuple = tuple(durations) if is_multi else (durations, )
+    if all(t > 0 for t in duration_tuple):
+        return durations
+
+    fallback_t, _, _ = bench(fn, num_warmups=5, num_tests=10)
+    dist_print(f'   ! Kineto returned zero kernel time; fallback to CUDA event time: '
+               f'{fallback_t * 1e6:.3f} us',
+               once_in_node=True)
+    patched = tuple(t if t > 0 else fallback_t for t in duration_tuple)
+    if isinstance(durations, list):
+        return list(patched)
+    return patched if isinstance(durations, tuple) else patched[0]
 
 
 def fold_expanded(expanded: Union[Tuple[torch.Tensor], torch.Tensor],
@@ -249,9 +268,9 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
             num_bytes_per_dispatch_token = safe_div(count_bytes(recv_x, recv_topk_idx, recv_topk_weights), recv_topk_idx.size(0))
             num_scaleup_bytes = num_bytes_per_dispatch_token * num_scaleup_recv_tokens  # Received via scaleup
             num_scaleout_bytes = num_bytes_per_dispatch_token * num_scaleout_send_tokens    # Send via scaleout
-            t, copy_t = bench_kineto(lambda: buffer.dispatch(**dispatch_args),
-                                    kernel_names=('dispatch_impl', 'dispatch_copy_epilogue_impl'),
-                                    barrier_comm_profiling=True, barrier=buffer.barrier, trace_path=get_trace_path('dispatch'))
+            t, copy_t = bench_kineto_with_event_fallback(lambda: buffer.dispatch(**dispatch_args),
+                                                         kernel_names=('dispatch_impl', 'dispatch_copy_epilogue_impl'),
+                                                         barrier_comm_profiling=True, barrier=buffer.barrier, trace_path=get_trace_path('dispatch'))
             dist_print(f'   * EP: {buffer.rank_idx:3}/{buffer.num_ranks} | '
                     f'dispatch: '
                     f'{num_scaleout_bytes / t / 1e9:.0f} GB/s (SO), '
@@ -260,9 +279,9 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
 
             # Test no-copy dispatch performance
             if no_copy_dispatch_args is not None:
-                t, copy_t = bench_kineto(lambda: buffer.dispatch(**no_copy_dispatch_args),
-                                        kernel_names=('dispatch_impl', 'dispatch_copy_epilogue_impl'),
-                                        barrier_comm_profiling=True, barrier=buffer.barrier, trace_path=get_trace_path('no_copy_dispatch'))
+                t, copy_t = bench_kineto_with_event_fallback(lambda: buffer.dispatch(**no_copy_dispatch_args),
+                                                             kernel_names=('dispatch_impl', 'dispatch_copy_epilogue_impl'),
+                                                             barrier_comm_profiling=True, barrier=buffer.barrier, trace_path=get_trace_path('no_copy_dispatch'))
                 dist_print(f'   ! EP: {buffer.rank_idx:3}/{buffer.num_ranks} | '
                         f'no-copy dispatch: '
                         f'{num_scaleout_bytes / t / 1e9:.0f} GB/s (SO), '
@@ -271,9 +290,9 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
 
             # Test expanded dispatch performance
             num_bytes_per_dispatch_token_meta = safe_div(count_bytes(expanded_handle.recv_src_metadata), expanded_handle.recv_src_metadata.size(0))
-            t, copy_t = bench_kineto(lambda: buffer.dispatch(**expanded_dispatch_args),
-                                    kernel_names=('dispatch_impl', 'dispatch_copy_epilogue_impl'),
-                                    barrier_comm_profiling=True, barrier=buffer.barrier, trace_path=get_trace_path('expanded_dispatch'))
+            t, copy_t = bench_kineto_with_event_fallback(lambda: buffer.dispatch(**expanded_dispatch_args),
+                                                         kernel_names=('dispatch_impl', 'dispatch_copy_epilogue_impl'),
+                                                         barrier_comm_profiling=True, barrier=buffer.barrier, trace_path=get_trace_path('expanded_dispatch'))
             dist_print(f'   - EP: {buffer.rank_idx:3}/{buffer.num_ranks} | '
                     f'expanded dispatch: '
                     f'{num_scaleout_bytes / t / 1e9:.0f} GB/s (SO), '
@@ -281,9 +300,9 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
                     f'copy: {(num_recv_tokens * (num_bytes_per_dispatch_token_meta + num_bytes_per_dispatch_token) + num_expanded_tokens * num_bytes_per_dispatch_token) / copy_t / 1e9:.0f} GB/s, {copy_t * 1e6:.3f} us')
 
             # Test cached dispatch performance
-            t, copy_t = bench_kineto(lambda: buffer.dispatch(**cached_dispatch_args),
-                                    kernel_names=('dispatch_impl', 'dispatch_copy_epilogue_impl'),
-                                    barrier_comm_profiling=True, barrier=buffer.barrier, trace_path=get_trace_path('cached_dispatch'))
+            t, copy_t = bench_kineto_with_event_fallback(lambda: buffer.dispatch(**cached_dispatch_args),
+                                                         kernel_names=('dispatch_impl', 'dispatch_copy_epilogue_impl'),
+                                                         barrier_comm_profiling=True, barrier=buffer.barrier, trace_path=get_trace_path('cached_dispatch'))
             dist_print(f'   # EP: {buffer.rank_idx:3}/{buffer.num_ranks} | '
                     f'cached dispatch: '
                     f'{num_scaleout_bytes / t / 1e9:.0f} GB/s (SO), '
@@ -343,9 +362,9 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
                 return num_scaleout_tokens * num_bytes_per_combine_token, num_scaleup_tokens * num_bytes_per_combine_token, num_reduction_read_tokens * num_bytes_per_combine_token
 
             num_scaleout_bytes, num_scaleup_bytes, num_reduction_read_bytes = get_combine_bytes(False)
-            t, copy_t = bench_kineto(lambda: buffer.combine(**combine_args),
-                                    kernel_names=('combine_impl', 'combine_reduce_epilogue_impl'),
-                                    barrier_comm_profiling=True, barrier=buffer.barrier, trace_path=get_trace_path('combine'))
+            t, copy_t = bench_kineto_with_event_fallback(lambda: buffer.combine(**combine_args),
+                                                         kernel_names=('combine_impl', 'combine_reduce_epilogue_impl'),
+                                                         barrier_comm_profiling=True, barrier=buffer.barrier, trace_path=get_trace_path('combine'))
             dist_print(f'   @ EP: {buffer.rank_idx:3}/{buffer.num_ranks} | '
                     f'combine: '
                     f'{num_scaleout_bytes / t / 1e9:.0f} GB/s (SO), '
@@ -354,9 +373,9 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
 
             # Test reduced combine performance
             num_scaleout_bytes, num_scaleup_bytes, num_reduction_read_bytes = get_combine_bytes(True)
-            t, copy_t = bench_kineto(lambda: buffer.combine(**reduced_combine_args),
-                                    kernel_names=('combine_impl', 'combine_reduce_epilogue_impl'),
-                                    barrier_comm_profiling=True, barrier=buffer.barrier, trace_path=get_trace_path('reduced_combine'))
+            t, copy_t = bench_kineto_with_event_fallback(lambda: buffer.combine(**reduced_combine_args),
+                                                         kernel_names=('combine_impl', 'combine_reduce_epilogue_impl'),
+                                                         barrier_comm_profiling=True, barrier=buffer.barrier, trace_path=get_trace_path('reduced_combine'))
             dist_print(f'   + EP: {buffer.rank_idx:3}/{buffer.num_ranks} | '
                     f'reduced combine: '
                     f'{num_scaleout_bytes / t / 1e9:.0f} GB/s (SO), '
