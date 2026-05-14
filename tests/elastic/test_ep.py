@@ -55,9 +55,17 @@ def bench_kineto_with_api_time(fn: Callable,
     start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_tests)]
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_tests)]
     for i in range(num_tests):
+        # Sync CPU so they enqueue roughly together
+        if dist.is_initialized():
+            dist.barrier()
+        # Sleep and sync GPU stream
         if barrier is not None:
             torch.cuda._sleep(int(2e7))
             barrier()
+        elif dist.is_initialized():
+            torch.cuda._sleep(int(2e7))
+            dist.all_reduce(torch.zeros(1, device='cuda'))
+            
         start_events[i].record()
         fn()
         end_events[i].record()
