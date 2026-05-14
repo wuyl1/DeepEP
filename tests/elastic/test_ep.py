@@ -45,7 +45,26 @@ def bench_kineto_with_api_time(fn: Callable,
                                kernel_names: Union[str, tuple],
                                **kwargs):
     durations = bench_kineto(fn, kernel_names=kernel_names, **kwargs)
-    api_t, _, _ = bench(fn, num_warmups=5, num_tests=10)
+    
+    # Custom API benchmark with barrier synchronization
+    barrier = kwargs.get('barrier')
+    num_warmups, num_tests = 5, 10
+    torch.cuda.synchronize()
+    for _ in range(num_warmups):
+        fn()
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_tests)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_tests)]
+    for i in range(num_tests):
+        if barrier is not None:
+            torch.cuda._sleep(int(2e7))
+            barrier()
+        start_events[i].record()
+        fn()
+        end_events[i].record()
+    torch.cuda.synchronize()
+    times = [s.elapsed_time(e) / 1e3 for s, e in zip(start_events, end_events)][1:]
+    api_t = sum(times) / len(times)
+    
     is_multi = isinstance(durations, (list, tuple))
     duration_tuple = tuple(durations) if is_multi else (durations, )
     if all(t > 0 for t in duration_tuple):
