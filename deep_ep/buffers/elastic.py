@@ -843,7 +843,9 @@ class ElasticBuffer:
                 previous_event: EventHandle = None,
                 previous_event_before_epilogue: Optional[EventHandle] = None,
                 async_with_compute_stream: bool = False,
-                allocate_on_comm_stream: bool = False) \
+                allocate_on_comm_stream: bool = False,
+                enable_hidden_chunk_pipeline: bool = False,
+                num_hidden_chunks: int = 1) \
             -> Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
         """
         Combine (reduce) tokens from different ranks back to their original ranks.
@@ -864,6 +866,10 @@ class ElasticBuffer:
                 finished if set.
             allocate_on_comm_stream: control whether all the allocated tensors' ownership to be on the
                 communication stream.
+            enable_hidden_chunk_pipeline: enable experimental hidden-chunk combine pipeline.
+                Disabled by default so native combine path is always preserved.
+            num_hidden_chunks: split hidden into this many chunks for experimental pipelined combine.
+                Values greater than 1 currently require single-node scale-up combine.
 
         Returns:
             combined_x: the reduced token tensor, with shape `[num_combined_tokens, hidden]` and type `torch.bfloat16`.
@@ -893,5 +899,7 @@ class ElasticBuffer:
                                  previous_event_before_epilogue,
                                  async_with_compute_stream,
                                  allocate_on_comm_stream,
-                                 handle.do_expand)
+                                 handle.do_expand,
+                                 enable_hidden_chunk_pipeline,
+                                 num_hidden_chunks)
         return combined_x, combined_topk_weights, EventOverlap(event)

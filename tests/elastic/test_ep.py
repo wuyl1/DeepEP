@@ -272,6 +272,24 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
         reduced_combined_x, reduced_combined_topk_weights, reduced_combine_event = \
             launch(buffer, 'combine', with_previous_event, async_with_compute_stream, reduced_combine_args)
 
+        pipelined_combined_x, pipelined_combined_topk_weights = None, None
+        pipelined_reduced_combined_x = None
+        pipelined_combine_args, pipelined_reduced_combine_args = None, None
+        if args.combine_pipeline_chunks > 1 and num_scaleout_ranks == 1:
+            pipelined_combine_args = combine_args | dict(
+                enable_hidden_chunk_pipeline=True,
+                num_hidden_chunks=args.combine_pipeline_chunks)
+            pipelined_reduced_combine_args = reduced_combine_args | dict(
+                enable_hidden_chunk_pipeline=True,
+                num_hidden_chunks=args.combine_pipeline_chunks)
+            pipelined_combined_x, pipelined_combined_topk_weights, _ = \
+                launch(buffer, 'combine', with_previous_event, async_with_compute_stream, pipelined_combine_args)
+            pipelined_reduced_combined_x, _, _ = \
+                launch(buffer, 'combine', with_previous_event, async_with_compute_stream, pipelined_reduced_combine_args)
+        elif args.combine_pipeline_chunks > 1:
+            dist_print('   ~ Pipelined combine is currently skipped for hybrid scale-out mode.',
+                       once_in_node=True)
+
         assert not (args.dump_profile_traces and args.skip_perf_test), '`--skip-perf-test` should not be specified when `--dump-profile-traces` is provided'
         if not args.skip_perf_test:
             # Profiling
@@ -420,6 +438,31 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
                     f'reduce: {(num_bias_bytes + num_reduction_read_bytes + num_reduction_write_bytes) / copy_t / 1e9:.0f} GB/s, {copy_t * 1e6:.3f} us | '
                     f'api: {num_scaleout_bytes / api_t / 1e9:.0f} GB/s (SO), '
                     f'{num_scaleup_bytes / api_t / 1e9:.0f} GB/s (SU), {api_t * 1e6:.3f} us')
+
+            if pipelined_combine_args is not None:
+                num_scaleout_bytes, num_scaleup_bytes, num_reduction_read_bytes = get_combine_bytes(False)
+                (t, copy_t), api_t = bench_kineto_with_api_time(lambda: buffer.combine(**pipelined_combine_args),
+                                                                kernel_names=('pipelined_combine_impl', 'pipelined_combine_reduce_epilogue_impl'),
+                                                                barrier_comm_profiling=True, barrier=buffer.barrier, trace_path=get_trace_path('pipelined_combine'))
+                dist_print(f'   ~ EP: {buffer.rank_idx:3}/{buffer.num_ranks} | '
+                        f'pipelined combine[{args.combine_pipeline_chunks}]: '
+                        f'{num_scaleout_bytes / t / 1e9:.0f} GB/s (SO), '
+                        f'{num_scaleup_bytes / t / 1e9:.0f} GB/s (SU), {t * 1e6:.3f} us, {num_scaleup_bytes:.0f} bytes | '
+                        f'reduce: {(num_bias_bytes + num_reduction_read_bytes + num_reduction_write_bytes) / copy_t / 1e9:.0f} GB/s, {copy_t * 1e6:.3f} us | '
+                        f'api: {num_scaleout_bytes / api_t / 1e9:.0f} GB/s (SO), '
+                        f'{num_scaleup_bytes / api_t / 1e9:.0f} GB/s (SU), {api_t * 1e6:.3f} us')
+
+                num_scaleout_bytes, num_scaleup_bytes, num_reduction_read_bytes = get_combine_bytes(True)
+                (t, copy_t), api_t = bench_kineto_with_api_time(lambda: buffer.combine(**pipelined_reduced_combine_args),
+                                                                kernel_names=('pipelined_combine_impl', 'pipelined_combine_reduce_epilogue_impl'),
+                                                                barrier_comm_profiling=True, barrier=buffer.barrier, trace_path=get_trace_path('pipelined_reduced_combine'))
+                dist_print(f'   ~ EP: {buffer.rank_idx:3}/{buffer.num_ranks} | '
+                        f'pipelined reduced combine[{args.combine_pipeline_chunks}]: '
+                        f'{num_scaleout_bytes / t / 1e9:.0f} GB/s (SO), '
+                        f'{num_scaleup_bytes / t / 1e9:.0f} GB/s (SU), {t * 1e6:.3f} us, {num_scaleup_bytes:.0f} bytes | '
+                        f'reduce: {(num_bias_bytes + num_reduction_read_bytes + num_reduction_write_bytes) / copy_t / 1e9:.0f} GB/s, {copy_t * 1e6:.3f} us | '
+                        f'api: {num_scaleout_bytes / api_t / 1e9:.0f} GB/s (SO), '
+                        f'{num_scaleup_bytes / api_t / 1e9:.0f} GB/s (SU), {api_t * 1e6:.3f} us')
             dist_print(once_in_node=True)
 
         # Checks
@@ -568,6 +611,13 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
                 f'Diff: {calc_diff(reduced_combined_x, ref_reduced_combined_y)}'
             assert torch.equal(combined_topk_weights, topk_weights), \
                 f'{calc_diff(combined_topk_weights, topk_weights)}'
+            if pipelined_combined_x is not None:
+                assert torch.equal(pipelined_combined_x, ref_combined_y), \
+                    f'Diff: {calc_diff(pipelined_combined_x, ref_combined_y)}'
+                assert torch.equal(pipelined_reduced_combined_x, ref_reduced_combined_y), \
+                    f'Diff: {calc_diff(pipelined_reduced_combined_x, ref_reduced_combined_y)}'
+                assert torch.equal(pipelined_combined_topk_weights, topk_weights), \
+                    f'{calc_diff(pipelined_combined_topk_weights, topk_weights)}'
 
         # Break on the first test case
         if args.test_first_only:
@@ -647,6 +697,8 @@ if __name__ == '__main__':
     parser.add_argument('--deterministic', action='store_true', help='Use deterministic algorithm')
     parser.add_argument('--enable-dispatch-no-copy', action='store_true',
                         help='Benchmark experimental direct BF16 normal dispatch no-copy path')
+    parser.add_argument('--combine-pipeline-chunks', type=int, default=1,
+                        help='Benchmark experimental hidden-chunk pipelined combine with this many chunks')
 
     # Test settings
     parser.add_argument('--seed', type=int, default=0, help='Default seed for pressure tests')

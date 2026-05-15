@@ -169,4 +169,24 @@ void combine_reduce(const int& lane_idx, int (&topk_slot_idx)[kNumValidTopk],
     }
 }
 
+template <int kChunkHiddenVec, int kUnrollFactor, int kNumExpectedTopk, int kNumValidTopk,
+          typename vec_t, typename get_src_buffer_ptr_func_t, typename wait_buffer_func_t>
+__device__ __forceinline__
+void combine_reduce_chunk(const int& lane_idx, int (&topk_slot_idx)[kNumValidTopk],
+                          vec_t* dst_buffer_ptr,
+                          const int& chunk_vec_offset,
+                          const get_src_buffer_ptr_func_t& get_src_buffer_ptr_func,
+                          const wait_buffer_func_t& wait_buffer_func,
+                          vec_t* bias_0 = nullptr, vec_t* bias_1 = nullptr) {
+    combine_reduce<kChunkHiddenVec, kUnrollFactor, kNumExpectedTopk>(
+        lane_idx, topk_slot_idx, dst_buffer_ptr,
+        [=](const int& slot_idx) {
+            return get_src_buffer_ptr_func(slot_idx) + chunk_vec_offset;
+        },
+        wait_buffer_func,
+        bias_0 == nullptr ? nullptr : bias_0 + chunk_vec_offset,
+        bias_1 == nullptr ? nullptr : bias_1 + chunk_vec_offset
+    );
+}
+
 }  // namespace deep_ep::elastic

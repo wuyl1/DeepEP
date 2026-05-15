@@ -20,6 +20,7 @@ struct WorkspaceLayout {
     static constexpr int kNumMaxExperts = 2048;
     static constexpr int kNumMaxExpertsPerRank = 256;
     static constexpr int kNumMaxInflightAGRS = 32;
+    static constexpr int kNumMaxCombineHiddenChunks = 8;
 
     static constexpr int64_t kNumBarrierSignalBytes = 16;
 
@@ -75,6 +76,9 @@ struct WorkspaceLayout {
 
         // AGRS signals
         num_bytes += (kNumMaxInflightAGRS + 1) * kNumMaxRanks * sizeof(int);
+
+        // Combine hidden-chunk pipeline readiness signals
+        num_bytes += kNumMaxCombineHiddenChunks * sizeof(int);
 
         // Ensure LDG.256 work
         return math::align<int64_t>(num_bytes, 32);
@@ -174,6 +178,12 @@ struct WorkspaceLayout {
         const auto base_ptr = math::advance_ptr<int>(
             get_agrs_recv_signal_ptr(0, 0), kNumMaxInflightAGRS * kNumMaxRanks * sizeof(int));
         return base_ptr + rank_idx;
+    }
+
+    __forceinline__ __device__ __host__ int* get_combine_chunk_ready_ptr(const int& chunk_idx) const {
+        const auto base_ptr = math::advance_ptr<int>(
+            get_agrs_session_signal_ptr(0), kNumMaxRanks * sizeof(int));
+        return base_ptr + chunk_idx;
     }
 };
 

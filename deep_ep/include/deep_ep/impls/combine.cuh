@@ -236,4 +236,236 @@ combine_impl(nv_bfloat16* x,
         gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
 }
 
+template <bool kIsScaleupNVLink,
+          bool kUseExpandedLayout, bool kAllowMultipleReduction,
+          int kNumSMs, int kNumWarps,
+          int kNumRanks,
+          int kHidden,
+          int kNumMaxTokensPerRank,
+          int kNumExperts, int kNumTopk,
+          int kNumQPs, int64_t kNumTimeoutCycles,
+          int kNumHiddenChunks,
+          int kNumThreads = kNumWarps * 32,
+          int kNumHiddenBytes = kHidden * sizeof(nv_bfloat16),
+          int kChunkHiddenBytes = kNumHiddenBytes / kNumHiddenChunks,
+          bool kUseRankLayout = use_rank_layout<kAllowMultipleReduction, kNumRanks, kNumTopk>(),
+          int kNumTokensInLayout = get_num_tokens_in_layout<kAllowMultipleReduction, kNumRanks, kNumTopk>(),
+          typename team_t = std::conditional_t<kIsScaleupNVLink, ncclTeamTagLsa, ncclTeamTagWorld>>
+__global__ void __launch_bounds__(kNumThreads, 1)
+pipelined_combine_impl(nv_bfloat16* x,
+                       float* topk_weights,
+                       int* src_metadata, int* psum_num_recv_tokens_per_scaleup_rank,
+                       const ncclDevComm_t nccl_dev_comm, const ncclWindow_t nccl_window,
+                       void* buffer, void* workspace,
+                       const int rank_idx,
+                       int num_reduced_tokens) {
+    EP_STATIC_ASSERT(kNumHiddenChunks > 1, "Invalid number of hidden chunks");
+    EP_STATIC_ASSERT(kNumHiddenChunks <= layout::WorkspaceLayout::kNumMaxCombineHiddenChunks, "Too many hidden chunks");
+    EP_STATIC_ASSERT(kNumHiddenBytes % kNumHiddenChunks == 0, "Invalid hidden chunking");
+    EP_STATIC_ASSERT(kChunkHiddenBytes % ptx::kNumTMAAlignBytes == 0, "Invalid hidden chunk alignment");
+    EP_STATIC_ASSERT(kChunkHiddenBytes % (32 * sizeof(int4)) == 0, "Invalid hidden chunk vector alignment");
+
+    // Utils
+    const auto sm_idx = static_cast<int>(blockIdx.x);
+    const auto thread_idx = static_cast<int>(threadIdx.x);
+    const auto warp_idx = (ptx::get_warp_idx() + rank_idx) % kNumWarps;
+    const auto lane_idx = ptx::get_lane_idx();
+    const auto global_warp_idx = warp_idx * kNumSMs + sm_idx;
+    constexpr bool kDoExpandedSend = not kAllowMultipleReduction and kUseExpandedLayout;
+
+    if (num_reduced_tokens == kNumMaxTokensPerRank * kNumRanks)
+        num_reduced_tokens = __ldg(psum_num_recv_tokens_per_scaleup_rank + kNumRanks - 1);
+
+    // Buffer layouts
+    extern __shared__ __align__(ptx::kNumTMAAlignBytes) int8_t smem[];
+    const auto token_layout = layout::TokenLayout(kNumHiddenBytes, 0, kNumTopk, false);
+    const auto tma_buffer = layout::BufferLayout<true>(token_layout, kNumWarps, 1, smem)
+        .get_rank_buffer(warp_idx).get_token_buffer(0);
+    const auto recv_buffer = layout::BufferLayout<false>(
+        token_layout, kNumTokensInLayout, kNumMaxTokensPerRank, buffer);
+    const auto send_buffer = layout::BufferLayout<false>(
+        token_layout, kNumRanks,
+        kNumMaxTokensPerRank * (kDoExpandedSend ? kNumTopk : 1),
+        recv_buffer.get_buffer_end_ptr());
+
+    // Init TMA
+    ptx::arrival_phase phase = 0;
+    const auto mbarrier_ptr = tma_buffer.get_mbarrier_ptr();
+    if (ptx::elect_one_sync())
+        ptx::mbarrier_init_with_fence(mbarrier_ptr, 1);
+    __syncwarp();
+
+    if constexpr (kUseExpandedLayout)
+        EP_DEVICE_ASSERT(topk_weights == nullptr);
+
+    const auto [qp_idx, sharing_mode] = comm::get_qp_mode<kNumSMs, kNumQPs, kNumWarps>(sm_idx, warp_idx);
+    const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
+    const auto workspace_layout = layout::WorkspaceLayout(workspace, 1, kNumRanks, kNumExperts);
+
+    // Reset chunk-ready signals before allowing the dependent epilogue to run.
+    if (sm_idx == 0 and thread_idx < kNumHiddenChunks)
+        *workspace_layout.get_combine_chunk_ready_ptr(thread_idx) = 0;
+    cooperative_groups::this_grid().sync();
+
+    // Full barrier to ensure the remote buffer is available.
+    comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
+                      kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kCombineTag0, false, false, true>(
+        gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
+
+    // Let the dependent reduce epilogue start. It will wait on per-chunk ready signals.
+    cudaTriggerProgrammaticLaunchCompletion();
+
+    int num_tokens_per_warp = math::ceil_div(num_reduced_tokens, kNumSMs * kNumWarps);
+    const int token_start_idx = num_tokens_per_warp * global_warp_idx;
+    const int token_end_idx = min(token_start_idx + num_tokens_per_warp, num_reduced_tokens);
+
+    using combine_vec_t = int4;
+    constexpr int kChunkHiddenVec = kChunkHiddenBytes / sizeof(combine_vec_t);
+    constexpr int kUnrollFactor = get_max_unroll_factor<kChunkHiddenVec, 4>();
+
+    #pragma unroll
+    for (int chunk_idx = 0; chunk_idx < kNumHiddenChunks; ++ chunk_idx) {
+        constexpr int kMetadataStride = 2 + kNumTopk;
+        const int chunk_byte_offset = chunk_idx * kChunkHiddenBytes;
+        const int chunk_vec_offset = chunk_byte_offset / sizeof(combine_vec_t);
+
+        for (int i = token_start_idx; i < token_end_idx; ++ i) {
+            const int src_token_idx = __ldg(src_metadata + i * kMetadataStride) % kNumMaxTokensPerRank;
+            const int src_rank_topk_idx = __ldg(src_metadata + i * kMetadataStride + 1);
+            const int src_rank_idx = src_rank_topk_idx / kNumTopk;
+            const int src_topk_idx = src_rank_topk_idx % kNumTopk;
+
+            const bool nvlink_bypass = gin.is_nvlink_accessible<team_t>(src_rank_idx);
+            layout::TokenLayout master_token_buffer = [=]() {
+                if (nvlink_bypass) {
+                    auto token_buffer = recv_buffer.get_rank_buffer(kUseRankLayout ? rank_idx : src_topk_idx).get_token_buffer(src_token_idx);
+                    token_buffer.set_base_ptr(gin.get_sym_ptr<team_t>(token_buffer.get_base_ptr(), src_rank_idx));
+                    return token_buffer;
+                }
+                return send_buffer.get_rank_buffer(src_rank_idx).get_token_buffer(src_token_idx);
+            }();
+
+            int stored_topk_slot_idx = -1;
+            if constexpr (kUseExpandedLayout) {
+                if (lane_idx < kNumTopk)
+                    stored_topk_slot_idx = __ldg(src_metadata + i * kMetadataStride + (2 + lane_idx));
+                __syncwarp();
+            }
+
+            auto reduce_valid_mask = ptx::gather(stored_topk_slot_idx >= 0);
+            auto no_local_reduce = not kUseExpandedLayout or (kAllowMultipleReduction and __popc(reduce_valid_mask) == 1);
+            if (no_local_reduce) {
+                int token_idx_in_tensor = i;
+                if constexpr (kUseExpandedLayout)
+                    token_idx_in_tensor = ptx::exchange(stored_topk_slot_idx, ptx::get_master_lane_idx(reduce_valid_mask));
+
+                if (ptx::elect_one_sync()) {
+                    const auto load_ptr = math::advance_ptr(
+                        x, static_cast<int64_t>(token_idx_in_tensor) * kNumHiddenBytes + chunk_byte_offset);
+                    ptx::tma_store_wait();
+                    ptx::tma_load_1d(tma_buffer.get_base_ptr(), load_ptr, mbarrier_ptr, kChunkHiddenBytes);
+                    ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kChunkHiddenBytes);
+                    ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                    ptx::tma_store_1d(math::advance_ptr(master_token_buffer.get_base_ptr(), chunk_byte_offset),
+                                      tma_buffer.get_base_ptr(), kChunkHiddenBytes);
+                    ptx::tma_store_commit();
+                }
+                __syncwarp();
+            } else if constexpr (kAllowMultipleReduction) {
+                int topk_slot_idx[kNumTopk];
+                compute_topk_slots(
+                    topk_slot_idx, reduce_valid_mask,
+                    [=](const int& idx) {
+                        return ptx::exchange(stored_topk_slot_idx, idx);
+                    }
+                );
+
+                combine_reduce_chunk<kChunkHiddenVec, kUnrollFactor, math::constexpr_ceil_div(kNumTopk, kNumRanks)>(
+                    lane_idx, topk_slot_idx, static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()), chunk_vec_offset,
+                    [=](const int& slot_idx) {
+                        return math::advance_ptr<combine_vec_t>(
+                            x, slot_idx * static_cast<int64_t>(kNumHiddenBytes));
+                    },
+                    [=]() {
+                        ptx::tma_store_wait();
+                        __syncwarp();
+                    }
+                );
+                ptx::tma_store_fence();
+                __syncwarp();
+
+                if (ptx::elect_one_sync()) {
+                    ptx::tma_store_1d(math::advance_ptr(master_token_buffer.get_base_ptr(), chunk_byte_offset),
+                                      tma_buffer.get_base_ptr(), kChunkHiddenBytes);
+                    ptx::tma_store_commit();
+                }
+                __syncwarp();
+            } else {
+                #pragma unroll
+                for (int k = 0; k < kNumTopk; ++ k) {
+                    const auto slot_idx = ptx::exchange(stored_topk_slot_idx, k);
+                    if (slot_idx >= 0) {
+                        const auto src_token_ptr = math::advance_ptr(
+                            x, slot_idx * static_cast<int64_t>(kNumHiddenBytes) + chunk_byte_offset);
+                        const auto token_buffer = recv_buffer.get_rank_buffer(k).get_token_buffer(src_token_idx);
+                        if (ptx::elect_one_sync()) {
+                            ptx::tma_store_wait();
+                            ptx::tma_load_1d(tma_buffer.get_base_ptr(), src_token_ptr, mbarrier_ptr, kChunkHiddenBytes);
+                            ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kChunkHiddenBytes);
+                            ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+
+                            if (nvlink_bypass) {
+                                ptx::tma_store_1d(
+                                    math::advance_ptr(gin.get_sym_ptr<team_t>(token_buffer.get_base_ptr(), src_rank_idx), chunk_byte_offset),
+                                    tma_buffer.get_base_ptr(), kChunkHiddenBytes);
+                                ptx::tma_store_commit();
+                            } else {
+                                const auto send_token_buffer =
+                                    send_buffer.get_rank_buffer(src_rank_idx).get_token_buffer(src_token_idx * kNumTopk + k);
+                                ptx::tma_store_1d(math::advance_ptr(send_token_buffer.get_base_ptr(), chunk_byte_offset),
+                                                  tma_buffer.get_base_ptr(), kChunkHiddenBytes);
+                                ptx::tma_store_commit();
+                                ptx::tma_store_wait();
+                                gin.put<team_t>(math::advance_ptr(token_buffer.get_base_ptr(), chunk_byte_offset),
+                                                math::advance_ptr(send_token_buffer.get_base_ptr(), chunk_byte_offset),
+                                                kChunkHiddenBytes, src_rank_idx);
+                            }
+                        }
+                        __syncwarp();
+                    }
+                }
+            }
+
+            if (chunk_idx == 0 and not kUseExpandedLayout and topk_weights != nullptr and lane_idx < kNumTopk) {
+                const float value = __ldg(topk_weights + (i * kNumTopk + lane_idx));
+                master_token_buffer.get_topk_weights_ptr()[lane_idx] = value;
+            }
+            __syncwarp();
+
+            if (not kDoExpandedSend and not nvlink_bypass and ptx::elect_one_sync()) {
+                ptx::tma_store_wait();
+                const auto dst_token_buffer = recv_buffer.get_rank_buffer(kUseRankLayout ? rank_idx : src_topk_idx)
+                    .get_token_buffer(src_token_idx);
+                gin.put<team_t>(math::advance_ptr(dst_token_buffer.get_base_ptr(), chunk_byte_offset),
+                                math::advance_ptr(master_token_buffer.get_base_ptr(), chunk_byte_offset),
+                                kChunkHiddenBytes, src_rank_idx);
+                if (chunk_idx == 0 and topk_weights != nullptr) {
+                    ptx::fence_acq_rel_sys();
+                    gin.put<team_t>(dst_token_buffer.get_topk_weights_ptr(),
+                                    master_token_buffer.get_topk_weights_ptr(),
+                                    kNumTopk * sizeof(float), src_rank_idx);
+                }
+            }
+            __syncwarp();
+        }
+
+        // Make the current hidden chunk visible to the local epilogue.
+        comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
+                          kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kCombineTag1, true, true, false>(
+            gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
+        if (sm_idx == 0 and thread_idx == 0)
+            ptx::st_release_sys(workspace_layout.get_combine_chunk_ready_ptr(chunk_idx), 1);
+    }
+}
+
 }  // deep_ep::elastic

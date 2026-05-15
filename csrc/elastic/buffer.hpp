@@ -1152,7 +1152,9 @@ public:
             const std::optional<EventHandle>& previous_event_before_epilogue,
             const bool& async_with_compute_stream,
             const bool& allocate_on_comm_stream,
-            const bool& use_expanded_layout) const {
+            const bool& use_expanded_layout,
+            const bool& enable_pipelined_combine,
+            const int& num_hidden_chunks) const {
         // Check SM count
         EP_HOST_ASSERT(num_sms > 0);
 
@@ -1207,6 +1209,15 @@ public:
         // All new tensor allocations should happen after this
         const auto compute_stream = stream_control_prologue(previous_event, allocate_on_comm_stream, async_with_compute_stream);
 
+        // Optional hidden-chunk pipeline is currently limited to pure scale-up combine.
+        const int effective_num_hidden_chunks = enable_pipelined_combine ?
+            (num_hidden_chunks <= 1 ? 1 : num_hidden_chunks) : 1;
+        EP_HOST_ASSERT(effective_num_hidden_chunks == 1 or nccl_context->num_scaleout_ranks == 1);
+        EP_HOST_ASSERT(effective_num_hidden_chunks <= layout::WorkspaceLayout::kNumMaxCombineHiddenChunks);
+        EP_HOST_ASSERT((hidden * static_cast<int>(sizeof(nv_bfloat16))) % effective_num_hidden_chunks == 0);
+        EP_HOST_ASSERT(((hidden * static_cast<int>(sizeof(nv_bfloat16))) / effective_num_hidden_chunks) % ptx::kNumTMAAlignBytes == 0);
+        EP_HOST_ASSERT(((hidden * static_cast<int>(sizeof(nv_bfloat16))) / effective_num_hidden_chunks) % (32 * static_cast<int>(sizeof(int4))) == 0);
+
         // Check buffer size
         EP_HOST_ASSERT(get_combine_buffer_size(num_max_tokens_per_rank, hidden, num_topk,
                                                nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
@@ -1257,6 +1268,7 @@ public:
             num_sms, jit::device_runtime->get_num_smem_bytes(),
             num_channels,
             use_expanded_layout, allow_multiple_reduction,
+            effective_num_hidden_chunks,
             comm_stream);
 
         // Allocate output tensors
@@ -1278,11 +1290,14 @@ public:
                                        num_experts, num_topk,
                                        reduce_buffer,
                                        bias_ptrs[0], bias_ptrs[1],
+                                       workspace,
                                        nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
                                        nccl_context->scaleout_rank_idx, nccl_context->scaleup_rank_idx,
+                                       num_gpu_timeout_cycles,
                                        jit::device_runtime->get_num_sms(),
                                        jit::device_runtime->get_num_smem_bytes(),
                                        use_expanded_layout, allow_multiple_reduction,
+                                       effective_num_hidden_chunks,
                                        comm_stream);
 
         // Stream control

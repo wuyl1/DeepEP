@@ -24,6 +24,7 @@ public:
         int num_topk;
         int num_qps;
         int64_t num_timeout_cycles;
+        int num_hidden_chunks;
 
         // Parameters
         nv_bfloat16* x;
@@ -46,17 +47,32 @@ public:
         std::string header_name, func_name;
         if (args.num_scaleout_ranks == 1) {
             header_name = "combine";
-            func_name = fmt::format("combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
-                                    args.is_scaleup_nvlink,
-                                    args.use_expanded_layout, args.allow_multiple_reduction,
-                                    args.launch_args.grid_dim.first,
-                                    args.launch_args.num_threads / 32,
-                                    args.num_scaleup_ranks * args.num_scaleout_ranks,
-                                    args.hidden,
-                                    args.num_max_tokens_per_rank,
-                                    args.num_experts,
-                                    args.num_topk,
-                                    args.num_qps, args.num_timeout_cycles);
+            if (args.num_hidden_chunks > 1) {
+                func_name = fmt::format("pipelined_combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+                                        args.is_scaleup_nvlink,
+                                        args.use_expanded_layout, args.allow_multiple_reduction,
+                                        args.launch_args.grid_dim.first,
+                                        args.launch_args.num_threads / 32,
+                                        args.num_scaleup_ranks * args.num_scaleout_ranks,
+                                        args.hidden,
+                                        args.num_max_tokens_per_rank,
+                                        args.num_experts,
+                                        args.num_topk,
+                                        args.num_qps, args.num_timeout_cycles,
+                                        args.num_hidden_chunks);
+            } else {
+                func_name = fmt::format("combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+                                        args.is_scaleup_nvlink,
+                                        args.use_expanded_layout, args.allow_multiple_reduction,
+                                        args.launch_args.grid_dim.first,
+                                        args.launch_args.num_threads / 32,
+                                        args.num_scaleup_ranks * args.num_scaleout_ranks,
+                                        args.hidden,
+                                        args.num_max_tokens_per_rank,
+                                        args.num_experts,
+                                        args.num_topk,
+                                        args.num_qps, args.num_timeout_cycles);
+            }
         } else {
             header_name = "hybrid_combine";
             func_name = fmt::format("hybrid_combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
@@ -129,6 +145,7 @@ static void* launch_combine(void* x,
                             const int& num_sms, const int& num_smem_bytes,
                             const int& num_channels,
                             const bool& use_expanded_layout, const bool& allow_multiple_reduction,
+                            const int& num_hidden_chunks,
                             const at::cuda::CUDAStream& stream) {
     // Maximize shared memory utilization
     const auto token_layout = get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk);
@@ -160,6 +177,7 @@ static void* launch_combine(void* x,
         .num_experts = num_experts,
         .num_topk = num_topk,
         .num_qps = num_qps, .num_timeout_cycles = num_timeout_cycles,
+        .num_hidden_chunks = num_hidden_chunks,
         .x = static_cast<nv_bfloat16*>(x),
         .topk_weights = static_cast<float*>(topk_weights),
         .src_metadata = src_metadata,
@@ -201,6 +219,8 @@ public:
         int hidden;
         int num_max_tokens_per_rank;
         int num_experts, num_topk;
+        int num_hidden_chunks;
+        int64_t num_timeout_cycles;
 
         // Parameters
         nv_bfloat16* combined_x;
@@ -209,6 +229,7 @@ public:
         void* reduce_buffer;
         void* bias_0;
         void* bias_1;
+        void* workspace;
         int num_combined_tokens;
         int scaleout_rank_idx, scaleup_rank_idx;
 
@@ -216,32 +237,56 @@ public:
     };
 
     static std::string generate_impl(const Args& args) {
+        const auto func_name = args.num_hidden_chunks > 1 ?
+            fmt::format("pipelined_combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+                        args.use_expanded_layout, args.allow_multiple_reduction,
+                        args.launch_args.grid_dim.first,
+                        args.launch_args.num_threads / 32,
+                        args.num_scaleout_ranks, args.num_scaleup_ranks,
+                        args.hidden,
+                        args.num_max_tokens_per_rank,
+                        args.num_experts, args.num_topk,
+                        args.num_hidden_chunks, args.num_timeout_cycles) :
+            fmt::format("combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+                        args.use_expanded_layout, args.allow_multiple_reduction,
+                        args.launch_args.grid_dim.first,
+                        args.launch_args.num_threads / 32,
+                        args.num_scaleout_ranks, args.num_scaleup_ranks,
+                        args.hidden,
+                        args.num_max_tokens_per_rank,
+                        args.num_experts, args.num_topk);
         return fmt::format(R"(
 #include <deep_ep/impls/combine_reduce_epilogue.cuh>
 
 using namespace deep_ep::elastic;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&{});
 }}
-)",                        args.use_expanded_layout, args.allow_multiple_reduction,
-                           args.launch_args.grid_dim.first,
-                           args.launch_args.num_threads / 32,
-                           args.num_scaleout_ranks, args.num_scaleup_ranks,
-                           args.hidden,
-                           args.num_max_tokens_per_rank,
-                           args.num_experts, args.num_topk);
+)",                        func_name);
     }
 
     static void launch_impl(const jit::KernelHandle& kernel, const jit::LaunchConfigHandle& config, Args args) {
-        EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(kernel, config,
-                                                 args.combined_x,
-                                                 args.combined_topk_weights,
-                                                 args.combined_topk_idx,
-                                                 args.reduce_buffer,
-                                                 args.bias_0, args.bias_1,
-                                                 args.num_combined_tokens,
-                                                 args.scaleout_rank_idx, args.scaleup_rank_idx));
+        if (args.num_hidden_chunks > 1) {
+            EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(kernel, config,
+                                                     args.combined_x,
+                                                     args.combined_topk_weights,
+                                                     args.combined_topk_idx,
+                                                     args.reduce_buffer,
+                                                     args.bias_0, args.bias_1,
+                                                     args.workspace,
+                                                     args.num_combined_tokens,
+                                                     args.scaleout_rank_idx, args.scaleup_rank_idx));
+        } else {
+            EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(kernel, config,
+                                                     args.combined_x,
+                                                     args.combined_topk_weights,
+                                                     args.combined_topk_idx,
+                                                     args.reduce_buffer,
+                                                     args.bias_0, args.bias_1,
+                                                     args.num_combined_tokens,
+                                                     args.scaleout_rank_idx, args.scaleup_rank_idx));
+        }
     }
 };
 
@@ -253,10 +298,13 @@ static void launch_combine_reduce_epilogue(void* combined_x,
                                            const int& num_experts, const int& num_topk,
                                            void* reduce_buffer,
                                            void* bias_0, void* bias_1,
+                                           void* workspace,
                                            const int& num_scaleout_ranks, const int& num_scaleup_ranks,
                                            const int& scaleout_rank_idx, const int& scaleup_rank_idx,
+                                           const int64_t& num_timeout_cycles,
                                            const int& num_sms, const int& num_smem_bytes,
                                            const bool& use_expanded_layout, const bool& allow_multiple_reduction,
+                                           const int& num_hidden_chunks,
                                            const at::cuda::CUDAStream& stream) {
     // Maximize shared memory utilization
     // Too many warps may cause performance degrade, so we limit into 1024
@@ -272,11 +320,14 @@ static void launch_combine_reduce_epilogue(void* combined_x,
         .hidden = hidden,
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .num_experts = num_experts, .num_topk = num_topk,
+        .num_hidden_chunks = num_hidden_chunks,
+        .num_timeout_cycles = num_timeout_cycles,
         .combined_x = static_cast<nv_bfloat16*>(combined_x),
         .combined_topk_weights = combined_topk_weights,
         .combined_topk_idx = combined_topk_idx,
         .reduce_buffer = reduce_buffer,
         .bias_0 = bias_0, .bias_1 = bias_1,
+        .workspace = workspace,
         .num_combined_tokens = num_combined_tokens,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
         .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 1, false, true)
