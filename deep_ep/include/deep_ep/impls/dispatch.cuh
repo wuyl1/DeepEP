@@ -73,15 +73,23 @@ dispatch_impl(
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
 
     // Direct no-copy layout extension:
-    //   recv_buffer | send_buffer(optional) | recv_x_buffer | recv_x_offset_buffer
+    //   recv_buffer | send_buffer(optional) | recv_x_buffer | recv_topk_idx_buffer |
+    //   recv_topk_weights_buffer | recv_src_metadata_buffer | recv_x_offset_buffer
     // `recv_x_offset_buffer[target_rank]` stores the compact base offset assigned by the target rank.
     const auto global_token_layout = layout::TokenLayout(kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true);
     const auto global_recv_buffer = layout::BufferLayout<false>(global_token_layout, kNumRanks, kNumMaxTokensPerRank, buffer);
     const auto global_send_buffer = layout::BufferLayout<false>(
         global_token_layout, kIsScaleupNVLink ? 0 : 1, kNumMaxTokensPerRank, global_recv_buffer.get_buffer_end_ptr());
     void* direct_recv_x_buffer = global_send_buffer.get_buffer_end_ptr();
+    constexpr int64_t kDirectNumTokenSlots = static_cast<int64_t>(kNumRanks) * kNumMaxTokensPerRank;
+    auto direct_recv_topk_idx_buffer = math::advance_ptr<topk_idx_t>(
+        direct_recv_x_buffer, kDirectNumTokenSlots * kNumHiddenBytes);
+    auto direct_recv_topk_weights_buffer = math::advance_ptr<float>(
+        direct_recv_topk_idx_buffer, kDirectNumTokenSlots * kNumTopk * sizeof(topk_idx_t));
+    auto direct_recv_src_metadata_buffer = math::advance_ptr<int>(
+        direct_recv_topk_weights_buffer, kDirectNumTokenSlots * kNumTopk * sizeof(float));
     auto direct_recv_x_offset_buffer = math::advance_ptr<int64_t>(
-        direct_recv_x_buffer, static_cast<int64_t>(kNumRanks) * kNumMaxTokensPerRank * kNumHiddenBytes);
+        direct_recv_src_metadata_buffer, kDirectNumTokenSlots * (kNumTopk + 2) * sizeof(int));
 
     if constexpr (kNoCopy) {
         if (sm_idx == 0 and thread_idx < kNumRanks)
@@ -375,14 +383,18 @@ dispatch_impl(
 
             // Load top-k indices and weights
             EP_STATIC_ASSERT(kNumTopk <= 32, "Insufficient lanes for loading top-k indices");
+            int stored_dst_expert_idx = -1;
+            float stored_topk_weight = 0;
             int stored_dst_rank_idx = -1;
             if (lane_idx < kNumTopk) {
                 const auto uncasted_dst_expert_idx = __ldg(topk_idx + token_idx * kNumTopk + lane_idx);
-                const auto dst_expert_idx = static_cast<int>(uncasted_dst_expert_idx);
-                stored_dst_rank_idx = dst_expert_idx >= 0 ? dst_expert_idx / kNumExpertsPerRank : -1;
-                tma_buffer.get_topk_idx_ptr()[lane_idx] = dst_expert_idx;
-                if (topk_weights != nullptr)
-                    tma_buffer.get_topk_weights_ptr()[lane_idx] = __ldg(topk_weights + token_idx * kNumTopk + lane_idx);
+                stored_dst_expert_idx = static_cast<int>(uncasted_dst_expert_idx);
+                stored_dst_rank_idx = stored_dst_expert_idx >= 0 ? stored_dst_expert_idx / kNumExpertsPerRank : -1;
+                tma_buffer.get_topk_idx_ptr()[lane_idx] = stored_dst_expert_idx;
+                if (topk_weights != nullptr) {
+                    stored_topk_weight = __ldg(topk_weights + token_idx * kNumTopk + lane_idx);
+                    tma_buffer.get_topk_weights_ptr()[lane_idx] = stored_topk_weight;
+                }
                 if (copied_topk_idx != nullptr)
                     copied_topk_idx[token_idx * kNumTopk + lane_idx] = uncasted_dst_expert_idx;
             }
@@ -464,10 +476,45 @@ dispatch_impl(
 
                 if (remote_recv_x_ptr != nullptr)
                     ptx::tma_store_1d(remote_recv_x_ptr, tma_buffer.get_hidden_ptr(), kNumHiddenBytes);
-                if (remote_metadata_ptr != nullptr)
-                    ptx::tma_store_1d(remote_metadata_ptr, tma_buffer.get_metadata_ptr(), kNumMetadataBytes);
+                if constexpr (not kIsScaleupNVLink) {
+                    if (remote_metadata_ptr != nullptr)
+                        ptx::tma_store_1d(remote_metadata_ptr, tma_buffer.get_metadata_ptr(), kNumMetadataBytes);
+                }
                 ptx::tma_store_commit();
                 __syncwarp();
+
+                if constexpr (kIsScaleupNVLink) {
+                    const auto remote_topk_idx_ptr = has_valid_dst_slot ?
+                        gin.get_sym_ptr<team_t>(
+                            direct_recv_topk_idx_buffer + compact_recv_x_idx * kNumTopk, stored_dst_rank_idx) : nullptr;
+                    const auto remote_topk_weights_ptr = has_valid_dst_slot ?
+                        gin.get_sym_ptr<team_t>(
+                            direct_recv_topk_weights_buffer + compact_recv_x_idx * kNumTopk, stored_dst_rank_idx) : nullptr;
+                    const auto remote_src_metadata_ptr = has_valid_dst_slot ?
+                        gin.get_sym_ptr<team_t>(
+                            direct_recv_src_metadata_buffer + compact_recv_x_idx * (kNumTopk + 2), stored_dst_rank_idx) : nullptr;
+                    int master_src_topk_idx = -1;
+                    #pragma unroll
+                    for (int k = 0; k < kNumTopk; ++ k) {
+                        const auto dst_expert_idx = ptx::exchange(stored_dst_expert_idx, k);
+                        const auto local_expert_idx =
+                            (stored_dst_rank_idx * kNumExpertsPerRank <= dst_expert_idx and
+                             dst_expert_idx < (stored_dst_rank_idx + 1) * kNumExpertsPerRank) ?
+                            dst_expert_idx - stored_dst_rank_idx * kNumExpertsPerRank : -1;
+                        master_src_topk_idx = master_src_topk_idx < 0 and local_expert_idx >= 0 ? k : master_src_topk_idx;
+                        if (has_valid_dst_slot)
+                            remote_topk_idx_ptr[k] = static_cast<topk_idx_t>(local_expert_idx);
+                        if (topk_weights != nullptr) {
+                            const auto weight = ptx::exchange(stored_topk_weight, k);
+                            if (has_valid_dst_slot)
+                                remote_topk_weights_ptr[k] = weight;
+                        }
+                    }
+                    if (has_valid_dst_slot) {
+                        remote_src_metadata_ptr[0] = rank_idx * kNumMaxTokensPerRank + token_idx;
+                        remote_src_metadata_ptr[1] = rank_idx * kNumTopk + master_src_topk_idx;
+                    }
+                }
 
                 if constexpr (not kIsScaleupNVLink) {
                     ptx::tma_store_wait();
@@ -521,7 +568,7 @@ dispatch_impl(
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kDispatchTag1, true, true, false>(
         gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
 
-    // Trigger the copy epilogue kernel
+    // Trigger the dependent copy epilogue kernel when the host launches one.
     cudaTriggerProgrammaticLaunchCompletion();
 
     // Clean atomic counters

@@ -543,10 +543,21 @@ public:
                 token_layout, num_ranks, num_max_tokens_per_rank);
             auto num_bytes = send_buffer_layout.get_num_bytes() + recv_buffer_layout.get_num_bytes();
             if (enable_dispatch_no_copy) {
+                const auto num_direct_token_slots = static_cast<int64_t>(num_ranks) * num_max_tokens_per_rank;
                 const auto recv_x_buffer_bytes =
-                    static_cast<int64_t>(num_ranks) * num_max_tokens_per_rank * hidden * elem_size;
+                    num_direct_token_slots * hidden * elem_size;
+                const auto recv_topk_idx_buffer_bytes =
+                    num_direct_token_slots * num_topk * static_cast<int64_t>(sizeof(topk_idx_t));
+                const auto recv_topk_weights_buffer_bytes =
+                    num_direct_token_slots * num_topk * static_cast<int64_t>(sizeof(float));
+                const auto recv_src_metadata_buffer_bytes =
+                    num_direct_token_slots * (num_topk + 2) * static_cast<int64_t>(sizeof(int));
                 const auto recv_x_offset_buffer_bytes = num_ranks * static_cast<int64_t>(sizeof(int64_t));
-                num_bytes += recv_x_buffer_bytes + recv_x_offset_buffer_bytes;
+                num_bytes += recv_x_buffer_bytes +
+                             recv_topk_idx_buffer_bytes +
+                             recv_topk_weights_buffer_bytes +
+                             recv_src_metadata_buffer_bytes +
+                             recv_x_offset_buffer_bytes;
             }
             return num_bytes;
         } else {
@@ -1026,7 +1037,11 @@ public:
         // Allocate received tensors
         // `recv_src_metadata` includes source token indices and buffer slot indices
         const auto num_allocated_tokens = do_expand ? num_expanded_tokens : num_recv_tokens;
+        const auto direct_no_copy_metadata = no_copy_dispatch && nccl_context->is_scaleup_nvlink;
         torch::Tensor recv_x;
+        void* direct_recv_topk_idx_ptr = nullptr;
+        void* direct_recv_topk_weights_ptr = nullptr;
+        void* direct_recv_src_metadata_ptr = nullptr;
         if (no_copy_dispatch) {
             const auto token_layout = get_dispatch_token_layout(hidden, x.element_size(), num_sf_packs, num_topk);
             const auto recv_buffer_layout = layout::BufferLayout<false>(
@@ -1036,15 +1051,28 @@ public:
                 num_max_tokens_per_rank, recv_buffer_layout.get_buffer_end_ptr());
             recv_x = torch::from_blob(send_buffer_layout.get_buffer_end_ptr(),
                                       {num_allocated_tokens, hidden}, x.options());
+            direct_recv_topk_idx_ptr = math::advance_ptr(
+                send_buffer_layout.get_buffer_end_ptr(),
+                static_cast<int64_t>(nccl_context->num_ranks) * num_max_tokens_per_rank * num_hidden_bytes);
+            direct_recv_topk_weights_ptr = math::advance_ptr(
+                direct_recv_topk_idx_ptr,
+                static_cast<int64_t>(nccl_context->num_ranks) * num_max_tokens_per_rank *
+                num_topk * sizeof(topk_idx_t));
+            direct_recv_src_metadata_ptr = math::advance_ptr(
+                direct_recv_topk_weights_ptr,
+                static_cast<int64_t>(nccl_context->num_ranks) * num_max_tokens_per_rank *
+                num_topk * sizeof(float));
         } else {
             recv_x = torch::empty({num_allocated_tokens, hidden}, x.options());
         }
         auto recv_sf = std::optional<torch::Tensor>();
         auto recv_topk_idx = std::optional<torch::Tensor>();
         auto recv_topk_weights = std::optional<torch::Tensor>();
-        auto recv_src_metadata = torch::empty(
-            {num_recv_tokens, num_topk + 2},
-            torch::TensorOptions(torch::kCUDA).dtype(torch::kInt));
+        auto recv_src_metadata = direct_no_copy_metadata ?
+            torch::from_blob(direct_recv_src_metadata_ptr, {num_recv_tokens, num_topk + 2},
+                             torch::TensorOptions(torch::kCUDA).dtype(torch::kInt)) :
+            torch::empty({num_recv_tokens, num_topk + 2},
+                         torch::TensorOptions(torch::kCUDA).dtype(torch::kInt));
 
         // Optional tensors
         void* recv_sf_ptr = nullptr;
@@ -1064,13 +1092,20 @@ public:
             recv_sf_ptr = recv_sf->data_ptr();
         }
         if (not do_expand) {
-            recv_topk_idx = torch::empty({num_allocated_tokens, num_topk}, topk_idx.options());
+            recv_topk_idx = direct_no_copy_metadata ?
+                torch::from_blob(direct_recv_topk_idx_ptr, {num_allocated_tokens, num_topk}, topk_idx.options()) :
+                torch::empty({num_allocated_tokens, num_topk}, topk_idx.options());
             recv_topk_idx_ptr = recv_topk_idx->data_ptr<topk_idx_t>();
         }
         if (topk_weights.has_value()) {
-            recv_topk_weights = do_expand ?
-                torch::empty({num_allocated_tokens}, topk_weights->options()) :
-                torch::empty({num_allocated_tokens, num_topk}, topk_weights->options());
+            if (direct_no_copy_metadata) {
+                recv_topk_weights = torch::from_blob(
+                    direct_recv_topk_weights_ptr, {num_allocated_tokens, num_topk}, topk_weights->options());
+            } else {
+                recv_topk_weights = do_expand ?
+                    torch::empty({num_allocated_tokens}, topk_weights->options()) :
+                    torch::empty({num_allocated_tokens, num_topk}, topk_weights->options());
+            }
             recv_topk_weights_ptr = recv_topk_weights->data_ptr<float>();
         }
 
@@ -1085,26 +1120,28 @@ public:
         }
         EP_HOST_ASSERT(psum_num_recv_tokens_per_expert.size(0) == num_local_experts);
 
-        // Launch copy kernels with full SMs
-        stream_control_before_epilogue(previous_event_before_epilogue);
-        launch_dispatch_copy_epilogue(buffer, workspace,
-                                      psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
-                                      psum_num_recv_tokens_per_expert.data_ptr<int>(),
-                                      recv_x.data_ptr(), recv_sf_ptr,
-                                      recv_topk_idx_ptr, recv_topk_weights_ptr,
-                                      recv_src_metadata.data_ptr<int>(),
-                                      channel_linked_list_ptr,
-                                      num_recv_tokens, num_max_tokens_per_rank,
-                                      num_hidden_bytes,
-                                      num_sf_packs, recv_sf_token_stride, recv_sf_hidden_stride,
-                                      num_experts, num_topk,
-                                      nccl_context->scaleout_rank_idx, nccl_context->scaleup_rank_idx,
-                                      nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
-                                      jit::device_runtime->get_num_sms(),
-                                      jit::device_runtime->get_num_smem_bytes(),
-                                      num_channels,
-                                      do_expand, cached_mode, no_copy_dispatch,
-                                      comm_stream);
+        // Launch copy kernels with full SMs. NVLink no-copy writes all normal dispatch outputs directly.
+        if (not direct_no_copy_metadata) {
+            stream_control_before_epilogue(previous_event_before_epilogue);
+            launch_dispatch_copy_epilogue(buffer, workspace,
+                                          psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
+                                          psum_num_recv_tokens_per_expert.data_ptr<int>(),
+                                          recv_x.data_ptr(), recv_sf_ptr,
+                                          recv_topk_idx_ptr, recv_topk_weights_ptr,
+                                          recv_src_metadata.data_ptr<int>(),
+                                          channel_linked_list_ptr,
+                                          num_recv_tokens, num_max_tokens_per_rank,
+                                          num_hidden_bytes,
+                                          num_sf_packs, recv_sf_token_stride, recv_sf_hidden_stride,
+                                          num_experts, num_topk,
+                                          nccl_context->scaleout_rank_idx, nccl_context->scaleup_rank_idx,
+                                          nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
+                                          jit::device_runtime->get_num_sms(),
+                                          jit::device_runtime->get_num_smem_bytes(),
+                                          num_channels,
+                                          do_expand, cached_mode, no_copy_dispatch,
+                                          comm_stream);
+        }
 
         // Stream control
         const auto event = stream_control_epilogue(

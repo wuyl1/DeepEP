@@ -326,9 +326,16 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
 
             # Test no-copy dispatch performance
             if no_copy_dispatch_args is not None:
-                (t, copy_t), api_t = bench_kineto_with_api_time(lambda: buffer.dispatch(**no_copy_dispatch_args),
-                                                                kernel_names=('dispatch_impl', 'dispatch_copy_epilogue_impl'),
-                                                                barrier_comm_profiling=True, barrier=buffer.barrier, trace_path=get_trace_path('no_copy_dispatch'))
+                direct_no_copy_metadata = buffer.num_rdma_ranks == 1
+                if direct_no_copy_metadata:
+                    t, api_t = bench_kineto_with_api_time(lambda: buffer.dispatch(**no_copy_dispatch_args),
+                                                          kernel_names='dispatch_impl',
+                                                          barrier_comm_profiling=True, barrier=buffer.barrier, trace_path=get_trace_path('no_copy_dispatch'))
+                    copy_t = 0
+                else:
+                    (t, copy_t), api_t = bench_kineto_with_api_time(lambda: buffer.dispatch(**no_copy_dispatch_args),
+                                                                    kernel_names=('dispatch_impl', 'dispatch_copy_epilogue_impl'),
+                                                                    barrier_comm_profiling=True, barrier=buffer.barrier, trace_path=get_trace_path('no_copy_dispatch'))
                 dist_print(f'   ! EP: {buffer.rank_idx:3}/{buffer.num_ranks} | '
                         f'no-copy dispatch: '
                         f'{num_scaleout_bytes / t / 1e9:.0f} GB/s (SO), '
