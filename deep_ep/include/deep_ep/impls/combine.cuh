@@ -263,7 +263,8 @@ pipelined_combine_impl(nv_bfloat16* x,
     EP_STATIC_ASSERT(kNumHiddenChunks <= layout::WorkspaceLayout::kNumMaxCombineHiddenChunks, "Too many hidden chunks");
     EP_STATIC_ASSERT(kNumHiddenBytes % kNumHiddenChunks == 0, "Invalid hidden chunking");
     EP_STATIC_ASSERT(kChunkHiddenBytes % ptx::kNumTMAAlignBytes == 0, "Invalid hidden chunk alignment");
-    EP_STATIC_ASSERT(kChunkHiddenBytes % (32 * sizeof(int4)) == 0, "Invalid hidden chunk vector alignment");
+    using combine_vec_t = typename CombineVecTraits<kChunkHiddenBytes>::vec_t;
+    EP_STATIC_ASSERT(kChunkHiddenBytes % (32 * sizeof(combine_vec_t)) == 0, "Invalid hidden chunk vector alignment");
 
     // Utils
     const auto sm_idx = static_cast<int>(blockIdx.x);
@@ -319,7 +320,6 @@ pipelined_combine_impl(nv_bfloat16* x,
     const int token_start_idx = num_tokens_per_warp * global_warp_idx;
     const int token_end_idx = min(token_start_idx + num_tokens_per_warp, num_reduced_tokens);
 
-    using combine_vec_t = int4;
     constexpr int kChunkHiddenVec = kChunkHiddenBytes / sizeof(combine_vec_t);
     constexpr int kUnrollFactor = get_max_unroll_factor<kChunkHiddenVec, 4>();
 

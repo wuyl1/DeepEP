@@ -174,7 +174,8 @@ pipelined_combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
     EP_STATIC_ASSERT(kNumHiddenChunks <= layout::WorkspaceLayout::kNumMaxCombineHiddenChunks, "Too many hidden chunks");
     EP_STATIC_ASSERT(kNumHiddenBytes % kNumHiddenChunks == 0, "Invalid hidden chunking");
     EP_STATIC_ASSERT(kChunkHiddenBytes % ptx::kNumTMAAlignBytes == 0, "Invalid hidden chunk alignment");
-    EP_STATIC_ASSERT(kChunkHiddenBytes % (32 * sizeof(int4)) == 0, "Invalid hidden chunk vector alignment");
+    using combine_vec_t = typename CombineVecTraits<kChunkHiddenBytes>::vec_t;
+    EP_STATIC_ASSERT(kChunkHiddenBytes % (32 * sizeof(combine_vec_t)) == 0, "Invalid hidden chunk vector alignment");
 
     const auto sm_idx = static_cast<int>(blockIdx.x);
     const auto thread_idx = static_cast<int>(threadIdx.x);
@@ -198,7 +199,6 @@ pipelined_combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
     // Wait only for the producer's early PDL trigger. Per-chunk data readiness is below.
     cudaGridDependencySynchronize();
 
-    using combine_vec_t = int4;
     constexpr int kChunkHiddenVec = kChunkHiddenBytes / sizeof(combine_vec_t);
     constexpr int kUnrollFactor = get_max_unroll_factor<kChunkHiddenVec, 4>();
 
